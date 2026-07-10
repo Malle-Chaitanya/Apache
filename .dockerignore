@@ -1,0 +1,11 @@
+# Installed fresh via npm ci inside the image — never copy host modules.
+node_modules
+web/node_modules
+# Build artifacts (regenerated in the build stage)
+web/dist
+dist
+# Secrets & local cruft
+.env
+.env.local
+.git
+*.log

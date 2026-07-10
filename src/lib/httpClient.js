@@ -11,7 +11,7 @@ export class HttpClient {
     this.maxRetries = maxRetries;
   }
 
-  async request(method, path, { query, body } = {}) {
+  async request(method, path, { query, body, multipart } = {}) {
     let url = path.startsWith('http') ? path : `${this.baseUrl}${path}`;
     if (query) {
       const qs = new URLSearchParams(query).toString();
@@ -21,11 +21,7 @@ export class HttpClient {
       await this.limiter.acquire();
       let res;
       try {
-        res = await fetch(url, {
-          method,
-          headers: { 'Content-Type': 'application/json', ...this.headers },
-          body: body ? JSON.stringify(body) : undefined,
-        });
+        res = await fetch(url, buildFetchInit(method, this.headers, body, multipart));
       } catch (err) {
         if (attempt === this.maxRetries) throw err;
         await backoff(attempt);
@@ -57,6 +53,20 @@ export class HttpError extends Error {
     this.body = body;
     this.url = url;
   }
+}
+
+// multipart: { fields?: object, files?: [{ field?, filename, contentType?, buffer }] }
+// FormData sets its own Content-Type (with boundary) — must not set it ourselves.
+function buildFetchInit(method, headers, body, multipart) {
+  if (multipart) {
+    const form = new FormData();
+    for (const [k, v] of Object.entries(multipart.fields || {})) form.append(k, v);
+    for (const f of multipart.files || []) {
+      form.append(f.field || 'attachments[]', new Blob([f.buffer], { type: f.contentType || 'application/octet-stream' }), f.filename);
+    }
+    return { method, headers: { ...headers }, body: form };
+  }
+  return { method, headers: { 'Content-Type': 'application/json', ...headers }, body: body ? JSON.stringify(body) : undefined };
 }
 
 function backoff(attempt, retryAfterSec) {

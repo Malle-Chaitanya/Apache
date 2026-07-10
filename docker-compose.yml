@@ -1,0 +1,74 @@
+# ITSM Migrator stack — production-grade, mirroring the GEM_CO pattern:
+#   self-hosted mongo:7.0 with AUTH, named volumes, healthchecks,
+#   ports bound to 127.0.0.1 only. Unique host ports (no clash with gem_co):
+#     app   → 4400   (gem_co uses 4000)
+#     mongo → 27018  (gem_co-mongodb uses 27017)
+#
+#   docker compose up -d --build
+#   open http://localhost:4400   (login: admin@cloudfuze.com / CloudFuze@2026)
+#
+# Compose reads variables from a local .env — override the dev defaults there
+# for production (and source secrets from a KMS / secret manager).
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: itsm-migration
+    ports:
+      - "127.0.0.1:4400:4400"
+    environment:
+      PORT: 4400
+      STORE: mongo
+      # Credentialed URI (authSource=admin: root user lives in admin). Passwords
+      # with special chars (@ : / etc.) must be percent-encoded here, so we take
+      # the full URI from .env; the literal password below feeds the DB itself.
+      MONGODB_URI: ${MONGODB_URI:-mongodb://itsm:changeme@mongodb:27017/itsm_migrator?authSource=admin}
+      SECRET_BACKEND: mongo
+      MIGRATION_SECRET_KEY: ${MIGRATION_SECRET_KEY:-Hg4oV9EYYu/kYgUUp6EX1CqTV9ur0lGIuD1xDQgKbgI=}
+      JWT_SECRET: ${JWT_SECRET:-29a1dbedaf37a3192bbbae8f585b17155f94efd9a4bd5fc8}
+      OAUTH_REDIRECT_URI: ${OAUTH_REDIRECT_URI:-http://localhost:5173/}
+      ZENDESK_CLIENT_ID: ${ZENDESK_CLIENT_ID:-}
+      ZENDESK_CLIENT_SECRET: ${ZENDESK_CLIENT_SECRET:-}
+      JIRA_CLIENT_ID: ${JIRA_CLIENT_ID:-}
+      JIRA_CLIENT_SECRET: ${JIRA_CLIENT_SECRET:-}
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    restart: unless-stopped
+    # Use node (always present) rather than wget/curl — the runtime image is
+    # node:20-slim, which bundles neither. Keeps the healthcheck portable across
+    # base-image changes.
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:4400/api/config').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  mongodb:
+    image: mongo:7.0
+    container_name: itsm-mongodb
+    ports:
+      - "127.0.0.1:27018:27017"   # Studio3T: mongodb://itsm:changeme@localhost:27018/?authSource=admin
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_USERNAME:-itsm}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD:-changeme}
+      MONGO_INITDB_DATABASE: ${MONGO_DATABASE:-itsm_migrator}
+    volumes:
+      - itsm_mongo_data:/data/db
+      - itsm_mongo_config:/data/configdb
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+volumes:
+  itsm_mongo_data:
+    driver: local
+  itsm_mongo_config:
+    driver: local

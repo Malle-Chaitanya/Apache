@@ -1,6 +1,6 @@
 import { repo } from '../db/repository.js';
-import { ZendeskSource } from '../connectors/zendesk/index.js';
-import { FreshdeskTarget } from '../connectors/freshdesk/index.js';
+import { makeSource, makeTarget } from '../connectors/registry.js';
+import { connectionManager } from '../auth/connectionManager.js';
 import { LOAD_ORDER, MATRIX } from '../mapping/matrix.js';
 import { extract } from './extractor.js';
 import { loadType } from './loader.js';
@@ -14,10 +14,24 @@ export async function runMigration(projectId, { dryRun = false } = {}) {
   if (!project) throw new Error('project not found');
 
   const job = await repo('jobs').insertOne({ projectId, mode: dryRun ? 'dry_run' : 'full', status: 'running', startedAt: new Date(), phasesCompleted: [] });
+
+  // Resolve credentials via the ConnectionManager. The engine is auth-agnostic:
+  // it never sees tokens/keys, only the connector-ready creds it hands to the
+  // connector factory. Refresh/expiry/reauth are handled inside get().
+  let src, tgt;
+  try {
+    src = await connectionManager.get(projectId, 'source');
+    tgt = await connectionManager.get(projectId, 'target');
+  } catch (err) {
+    await repo('projects').updateOne({ _id: projectId }, { status: err.reauth ? 'reauth_required' : 'failed' });
+    await repo('jobs').updateOne({ _id: job._id }, { status: 'failed', error: err.message, finishedAt: new Date() });
+    throw err;
+  }
+
   const ctx = {
     project, dryRun,
-    source: new ZendeskSource(),
-    target: new FreshdeskTarget(),
+    source: makeSource(project.source.platform, src.connectorCreds),
+    target: makeTarget(project.target.platform, tgt.connectorCreds),
     idCache: new Map(),
     conflicts: [],
     stats: { migrated: 0, manual: 0, failed: 0, comments: 0 },
@@ -65,9 +79,14 @@ export async function runMigration(projectId, { dryRun = false } = {}) {
     ctx.emit('report', null, `migration ${dryRun ? '(dry-run) ' : ''}complete: ${summary.totals.migrated} migrated, ${summary.totals.manual} manual, ${summary.totals.failed} failed`);
     return summary;
   } catch (err) {
-    log.error(`migration failed: ${err.message}`);
-    await repo('projects').updateOne({ _id: projectId }, { status: 'failed' });
-    await repo('jobs').updateOne({ _id: job._id }, { status: 'failed', error: err.message, finishedAt: new Date() });
+    // A 401/403 mid-run = the customer's credential was rotated/revoked. Don't
+    // fail the migration — flip to reauth_required so a reconnect can resume
+    // from the checkpoint (idmap guarantees no duplicates).
+    const authFail = err.reauth || err.status === 401 || err.status === 403;
+    if (authFail) await connectionManager.markReauthRequired(projectId, 'target', err.message);
+    log.error(`migration ${authFail ? 'paused — reauth required' : 'failed'}: ${err.message}`);
+    await repo('projects').updateOne({ _id: projectId }, { status: authFail ? 'reauth_required' : 'failed' });
+    await repo('jobs').updateOne({ _id: job._id }, { status: authFail ? 'paused' : 'failed', error: err.message, finishedAt: new Date() });
     throw err;
   }
 }

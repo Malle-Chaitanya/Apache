@@ -11,6 +11,8 @@ export async function extract(ctx) {
     const meta = MATRIX[type];
     const rows = await source.list(type);
     for (const raw of rows) {
+      // Ticket conversations are a sub-resource; pull them into the staged doc.
+      if (type === 'tickets') raw.comments = await source.listComments(raw);
       const sourceId = String(raw.id);
       await repo(type).upsert(
         { projectId: project._id, sourceId },

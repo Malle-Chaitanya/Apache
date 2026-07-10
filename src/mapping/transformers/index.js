@@ -3,7 +3,7 @@
 //   ctx.resolve(type, sourceId) → target id (from idmap cache) or null
 //   ctx.addConflict(kind, detail, suggestion)
 // No inference/LLM anywhere — pure rules + value maps.
-import { mapStatus, mapPriority, mapSource, mapFieldType, ROLE_DEFAULT } from '../valueMaps.js';
+import { mapStatus, mapPriority, mapSource, mapFieldType, ROLE_DEFAULT, mapAgentRole } from '../valueMaps.js';
 
 const asId = (v) => (v == null ? null : Number(v));
 
@@ -18,7 +18,14 @@ export const transformers = {
 
   agent: (r, ctx) => {
     const group_ids = (r.group_ids || []).map((g) => ctx.resolve('groups', g)).filter(Boolean).map(asId);
-    return { payload: { name: r.name, email: r.email, group_ids, ticket_scope: 1 }, notes: 'role_ids omitted (roles not API-creatable; see conflicts)' };
+    const { role, ticketScope, billingAdmin } = mapAgentRole(r);
+    if (billingAdmin) ctx.addConflict('unmapped_field', `Agent "${r.name}" is a Zendesk Billing admin → mapped to Freshdesk "Administrator" (no billing access on FD Administrator).`, 'Grant "Account Administrator" manually if this agent must manage billing.');
+    // role name → resolved to the target account's role_id by the connector at load time.
+    return {
+      payload: { name: r.name, email: r.email, group_ids, ticket_scope: ticketScope },
+      ctxOut: { role },
+      notes: `role ${r.role}${r.role_type != null ? `/type ${r.role_type}` : ''} → Freshdesk "${role}" (scope ${ticketScope})`,
+    };
   },
 
   ticketField: (r, ctx) => {
@@ -93,6 +100,7 @@ export const transformers = {
       targetType: c.public ? 'ticketReply' : 'ticketNote',
       sourceId: String(c.id),
       payload: { body: c.body, private: !c.public, user_id: asId(ctx.resolve('users', c.author_id)) || asId(ctx.resolve('agents', c.author_id)) },
+      attachments: (c.attachments || []).map((a) => ({ url: a.content_url, filename: a.file_name, contentType: a.content_type, size: a.size })),
     }));
     return { payload, children };
   },

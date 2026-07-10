@@ -6,7 +6,7 @@
 // is a config flag (STORE=memory|mongo), never an engine change.
 // ─────────────────────────────────────────────────────────────
 import { config } from '../config.js';
-import { CONTROL_COLLECTIONS, STAGING_COLLECTIONS, EntitySchema } from './schemas.js';
+import { CONTROL_COLLECTIONS, STAGING_COLLECTIONS, ALL_COLLECTIONS, EntitySchema } from './schemas.js';
 
 // Naive query matcher shared by the memory adapter. Supports top-level
 // equality and { $in: [...] } — the only shapes the engine uses.
@@ -51,6 +51,7 @@ class MemoryAdapter {
     return this.insertOne(name, { ...query, ...doc });
   }
   async clear(name) { if (name) this._col(name).clear(); else this.cols.clear(); }
+  async ensureCollections() { /* no-op: memory collections are created on first write */ }
 }
 
 class MongoAdapter {
@@ -62,8 +63,8 @@ class MongoAdapter {
     this.models.set(name, model);
     return model;
   }
-  async insertOne(name, doc) { return (await this._model(name).create(doc)).toObject(); }
-  async insertMany(name, docs) { return (await this._model(name).insertMany(docs)).map((d) => d.toObject()); }
+  async insertOne(name, doc) { return normalizeId((await this._model(name).create(doc)).toObject()); }
+  async insertMany(name, docs) { return (await this._model(name).insertMany(docs)).map((d) => normalizeId(d.toObject())); }
   async find(name, query = {}, { limit } = {}) {
     let q = this._model(name).find(query);
     if (limit) q = q.limit(limit);
@@ -79,11 +80,33 @@ class MongoAdapter {
   }
   async clear(name) {
     if (name) return void this._model(name).deleteMany({});
-    await Promise.all([...Object.keys(CONTROL_COLLECTIONS), ...STAGING_COLLECTIONS].map((n) => this._model(n).deleteMany({})));
+    await Promise.all(ALL_COLLECTIONS.map((n) => this._model(n).deleteMany({})));
+  }
+
+  // Materialize every collection + build its indexes up front, so the full
+  // schema is visible in Studio 3T before any data flows (and so unique/TTL
+  // indexes exist before the first write races them).
+  async ensureCollections() {
+    for (const name of ALL_COLLECTIONS) {
+      const model = this._model(name);
+      try { await model.createCollection(); } catch (e) { if (e.codeName !== 'NamespaceExists') throw e; }
+      await model.syncIndexes();
+    }
   }
 }
 
-const normalizeId = (d) => { if (d && d._id) d._id = String(d._id); return d; };
+// Mongo returns ObjectId instances (from _id and every `ref` field). The engine
+// keys everything by string, and the memory adapter uses string ids — so we
+// stringify ALL ObjectId-valued top-level fields on read. This is the fix that
+// makes relations wire up consistently across both adapters: Mongo stores real
+// ObjectIds (efficient indexes, working $lookup/populate), the engine always
+// sees strings, and Mongoose re-casts strings → ObjectId on write/query.
+const isObjectId = (v) => v && typeof v === 'object' && typeof v.toHexString === 'function';
+const normalizeId = (d) => {
+  if (!d || typeof d !== 'object') return d;
+  for (const k of Object.keys(d)) if (isObjectId(d[k])) d[k] = String(d[k]);
+  return d;
+};
 
 let adapter = null;
 
@@ -96,6 +119,7 @@ export async function initStore() {
   } else {
     adapter = new MemoryAdapter();
   }
+  await adapter.ensureCollections();
   return adapter;
 }
 
