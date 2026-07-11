@@ -19,9 +19,11 @@ const TARGET = {
   ticketReply: { path: (c) => `/tickets/${c.ticketId}/reply`, creatable: true },
   ticketNote: { path: (c) => `/tickets/${c.ticketId}/notes`, creatable: true },
   ticketForms: { path: () => '/admin/forms', creatable: true, verifyLive: true },
-  slaPolicies: { path: () => '/sla_policies', creatable: false, verifyLive: true },
-  businessHours: { path: () => '/business_hours', creatable: false },
-  products: { path: () => '/products', creatable: false },
+  // Best-effort: attempt the create; if the plan/endpoint rejects it the loader
+  // turns it into a manual checklist item instead of a hard failure.
+  slaPolicies: { path: () => '/sla_policies', creatable: true, bestEffort: true, verifyLive: true },
+  businessHours: { path: () => '/business_hours', creatable: true, bestEffort: true },
+  products: { path: () => '/products', creatable: true, bestEffort: true },
   roles: { path: () => '/roles', creatable: false },
   automationRules: { path: () => '/automations', creatable: false },
   scenarioAutomations: { path: () => '/scenario_automations', creatable: false },
@@ -44,7 +46,7 @@ export class FreshdeskTarget {
 
   capability(targetType) {
     const t = TARGET[targetType];
-    return { known: !!t, creatable: !!t?.creatable, verifyLive: !!t?.verifyLive };
+    return { known: !!t, creatable: !!t?.creatable, verifyLive: !!t?.verifyLive, bestEffort: !!t?.bestEffort };
   }
 
   // ctx.attachments (set by the loader for replies/notes carrying downloaded
@@ -74,6 +76,20 @@ export class FreshdeskTarget {
       this._roleCache = new Map((Array.isArray(data) ? data : []).map((r) => [String(r.name).toLowerCase(), r.id]));
     }
     return this._roleCache.get(String(name).toLowerCase()) || null;
+  }
+
+  // Canned responses must live in a folder. Find/create one and cache its id,
+  // so macro replies (→ canned responses) have a valid parent.
+  async ensureCannedFolder(name = 'Migrated from Zendesk') {
+    if (this._cannedFolderId) return this._cannedFolderId;
+    try {
+      const { data } = await this.http.get('/canned_response_folders');
+      const found = (Array.isArray(data) ? data : []).find((f) => f.name === name);
+      if (found) { this._cannedFolderId = found.id; return found.id; }
+    } catch { /* fall through to create */ }
+    const { data } = await this.http.post('/canned_response_folders', { body: { name } });
+    this._cannedFolderId = data.id;
+    return data.id;
   }
 
   // Dedup: reuse an existing contact/company instead of creating a duplicate.

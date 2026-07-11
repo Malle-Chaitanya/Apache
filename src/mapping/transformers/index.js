@@ -29,27 +29,30 @@ export const transformers = {
   },
 
   ticketField: (r, ctx) => {
+    // Zendesk system fields already exist on Freshdesk as built-ins — don't recreate.
+    const SYSTEM = new Set(['subject', 'description', 'status', 'priority', 'group', 'assignee', 'tickettype', 'custom_status', 'requester', 'organization']);
+    if (SYSTEM.has(r.type)) {
+      ctx.addConflict('skipped', `Zendesk system field "${r.title}" (${r.type}) already exists on Freshdesk — skipped.`, null);
+      return { manual: true, payload: { label: r.title, systemField: r.type } };
+    }
     const type = mapFieldType(r.type);
-    const payload = { label: r.title, type, required_for_closure: !!r.required };
-    if (r.custom_field_options) payload.choices = r.custom_field_options.map((o) => o.name);
+    // Freshdesk requires label_for_customers on customer-visible custom fields.
+    const payload = { label: r.title, label_for_customers: r.title, type, customers_can_edit: false, required_for_closure: !!r.required };
+    // Freshdesk dropdown choices must be {value, position} objects — a bare
+    // string array makes POST /admin/ticket_fields return a generic HTTP 500
+    // (verified live against the API). Position is 1-based, preserving source order.
+    if (r.custom_field_options) payload.choices = r.custom_field_options.map((o, i) => ({ value: o.name, position: i + 1 }));
     if (r.type === 'regexp') ctx.addConflict('unmapped_field', `Field "${r.title}" is a Zendesk regex field; Freshdesk has no regex type. Migrated as text; validation "${r.regexp_for_validation}" not enforced.`, 'Add front-end validation or a workflow check.');
     return { payload };
   },
 
-  brand: (r, ctx) => {
-    ctx.addConflict('no_api', `Freshdesk has no API to create Products (Zendesk brand "${r.name}").`, 'Create the Product in Admin → Products; then support email/DNS verification is manual.');
-    return { payload: { name: r.name, description: `Migrated from Zendesk brand ${r.subdomain}` }, manual: true };
-  },
+  // Best-effort (loader attempts the API; falls back to the checklist if the
+  // plan/endpoint rejects it — see freshdesk connector `bestEffort`).
+  brand: (r) => ({ payload: { name: r.name, description: `Migrated from Zendesk brand ${r.subdomain || r.name}` } }),
 
-  businessHours: (r, ctx) => {
-    ctx.addConflict('no_api', `Freshdesk has no API to create Business Hours ("${r.name}").`, 'Recreate the weekly schedule + holidays in Admin → Business Hours (timezone ' + r.time_zone + ').');
-    return { payload: { name: r.name, time_zone: r.time_zone, intervals: r.intervals }, manual: true };
-  },
+  businessHours: (r) => ({ payload: { name: r.name, time_zone: r.time_zone, business_hours: r.intervals } }),
 
-  sla: (r, ctx) => {
-    ctx.addConflict('no_api', `SLA policy "${r.title}" — Freshdesk create-SLA API is VERIFY-LIVE; may be update-only.`, 'Confirm POST /sla_policies on target plan; else set default via PUT and add extras in UI.');
-    return { payload: { name: r.title, sla_target: r.policy_metrics }, manual: true };
-  },
+  sla: (r) => ({ payload: { name: r.title, sla_target: r.policy_metrics } }),
 
   // ── automation logic translation → intermediate representation (IR) ──
   trigger: (r, ctx) => translateRule(r, 'trigger', ctx),
@@ -78,30 +81,47 @@ export const transformers = {
   },
 
   ticket: (r, ctx) => {
-    const custom = {};
-    for (const cf of r.custom_fields || []) custom[`cf_${cf.id}`] = cf.value;
+    // Only Freshdesk's built-in ticket types are valid; others (e.g. Zendesk
+    // "task") are omitted rather than rejected.
+    const FD_TYPES = { question: 'Question', incident: 'Incident', problem: 'Problem' };
     const payload = {
-      subject: r.subject,
-      description: r.description || r.subject,
+      subject: r.subject || '(no subject)',
+      description: r.description || r.subject || '(migrated from Zendesk)',
       status: mapStatus(r.status),
       priority: mapPriority(r.priority),
       source: mapSource(r.via?.channel),
-      type: r.type ? capitalize(r.type) : undefined,
+      type: FD_TYPES[r.type] || undefined,
       group_id: asId(ctx.resolve('groups', r.group_id)),
       responder_id: asId(ctx.resolve('agents', r.assignee_id)),
       requester_id: asId(ctx.resolve('users', r.requester_id)),
       company_id: asId(ctx.resolve('organizations', r.organization_id)),
       tags: r.tags || [],
-      custom_fields: custom,
-      created_at: r.created_at,
-      updated_at: r.updated_at,
     };
-    const children = (r.comments || []).map((c) => ({
-      targetType: c.public ? 'ticketReply' : 'ticketNote',
-      sourceId: String(c.id),
-      payload: { body: c.body, private: !c.public, user_id: asId(ctx.resolve('users', c.author_id)) || asId(ctx.resolve('agents', c.author_id)) },
-      attachments: (c.attachments || []).map((a) => ({ url: a.content_url, filename: a.file_name, contentType: a.content_type, size: a.size })),
-    }));
+    // NOTE: Freshdesk's create-ticket API rejects created_at/updated_at as
+    // "invalid_field" (no backdating on the public endpoint) — including them
+    // fails the whole ticket with HTTP 400. The original Zendesk timestamps are
+    // preserved in staging (sourceRaw) for reporting, but the migrated ticket
+    // carries the migration date.
+    // Custom-field VALUES are deferred (v2): Zendesk cf ids need mapping to the
+    // created Freshdesk field names first, else the ticket create is rejected.
+    if (!payload.requester_id) ctx.addConflict('unmapped_field', `Ticket "${(r.subject || '').slice(0, 40)}" requester not among migrated contacts — Freshdesk needs a requester.`, 'Migrate the requester (end-user), or set a default requester.');
+    const children = (r.comments || []).map((c) => {
+      const author = asId(ctx.resolve('users', c.author_id)) || asId(ctx.resolve('agents', c.author_id));
+      // Freshdesk splits conversations into two endpoints with DIFFERENT payloads:
+      //   public comment  → POST /reply  (accepts body + user_id; rejects `private`)
+      //   private comment → POST /notes  (accepts body + user_id + private:true)
+      // Sending `private` to /reply fails with HTTP 400 invalid_field, so only
+      // notes carry it.
+      const payload = c.public
+        ? { body: c.body, user_id: author }
+        : { body: c.body, private: true, user_id: author };
+      return {
+        targetType: c.public ? 'ticketReply' : 'ticketNote',
+        sourceId: String(c.id),
+        payload,
+        attachments: (c.attachments || []).map((a) => ({ url: a.content_url, filename: a.file_name, contentType: a.content_type, size: a.size })),
+      };
+    });
     return { payload, children };
   },
 };

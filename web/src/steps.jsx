@@ -1,26 +1,6 @@
 import React, { useState } from 'react';
 import * as XLSX from 'xlsx';
 import { api } from './api.js';
-import PlatformLogo from './PlatformLogo.jsx';
-
-// ── platform metadata ──
-const DEFAULT_AUTH = { zendesk: 'api_token', freshdesk: 'api_key', freshservice: 'api_key', jira: 'oauth', servicenow: 'instance_oauth' };
-const AUTH_OPTIONS = { zendesk: ['api_token', 'oauth'], freshdesk: ['api_key'], freshservice: ['api_key'], jira: ['oauth'], servicenow: ['instance_oauth'] };
-const FIELDS = {
-  zendesk: { api_token: ['subdomain', 'email', 'apiToken'], oauth: ['subdomain'] },
-  freshdesk: { api_key: ['domain', 'apiKey'] },
-  freshservice: { api_key: ['domain', 'apiKey'] },
-  jira: { oauth: [] },
-  servicenow: { instance_oauth: ['instanceUrl', 'clientId', 'clientSecret', 'username', 'password'] },
-};
-const LABEL = {
-  subdomain: ['Zendesk subdomain', 'yourcompany'], domain: ['Freshdesk domain', 'yourcompany.freshdesk.com'],
-  email: ['Admin email', 'you@company.com'], apiToken: ['API token', '••••••••'], apiKey: ['API key', '••••••••'],
-  instanceUrl: ['Instance URL', 'https://yourcompany.service-now.com'], clientId: ['Client ID', ''], clientSecret: ['Client secret', '••••••••'],
-  username: ['Integration user', ''], password: ['Password', '••••••••'],
-};
-const SECRET_FIELDS = new Set(['apiToken', 'apiKey', 'clientSecret', 'password']);
-const AUTH_LABEL = { api_token: 'API token', api_key: 'API key', oauth: 'OAuth (click-consent)', instance_oauth: 'Instance OAuth' };
 
 export function Stepper({ steps, current }) {
   return (
@@ -45,111 +25,59 @@ export function ReauthBanner({ connections, onReconnect }) {
   );
 }
 
-function PlatformHead({ side, platform }) {
-  return (
-    <div className="platform">
-      <div className={`logo ${platform}`}><PlatformLogo platform={platform} /></div>
-      <div className="meta"><div className="side">{side}</div><div className="name">{platform}</div></div>
-    </div>
-  );
-}
-
-function ConnectCard({ projectId, side, platform, connection, onChanged }) {
-  const [authType, setAuthType] = useState(connection?.authType || DEFAULT_AUTH[platform]);
-  const [values, setValues] = useState({});
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState('');
-  const connected = connection?.status === 'connected';
-  const fields = FIELDS[platform]?.[authType] || [];
-  const isOAuth = authType === 'oauth';
-
-  const set = (k, v) => setValues((s) => ({ ...s, [k]: v }));
-
-  async function save() {
-    setBusy(true); setError('');
-    try {
-      if (isOAuth) {
-        const out = await api.beginConnect(projectId, side, { platform, authType, instance: values.subdomain });
-        if (out.redirectUrl) window.open(out.redirectUrl, '_blank', 'noopener');
-      } else {
-        await api.completeConnect(projectId, side, { platform, authType, fields: values, instance: values.subdomain });
-      }
-      await onChanged();
-    } catch (e) { setError(e.message); }
-    setBusy(false);
-  }
-
-  return (
-    <div className="card conn">
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
-        <PlatformHead side={side} platform={platform} />
-        <span className={`pill ${connection?.status || 'pending'}`}>{connection?.status || 'not connected'}</span>
-      </div>
-
-      {connected ? (
-        <div className="hint">Connected as <b>{connection.subdomain || connection.domain || connection.instanceUrl}</b> via {AUTH_LABEL[connection.authType] || connection.authType}.</div>
-      ) : (
-        <>
-          {AUTH_OPTIONS[platform].length > 1 && (
-            <div className="field">
-              <label>Authentication method</label>
-              <select value={authType} onChange={(e) => setAuthType(e.target.value)}>
-                {AUTH_OPTIONS[platform].map((a) => <option key={a} value={a}>{AUTH_LABEL[a]}</option>)}
-              </select>
-            </div>
-          )}
-          {fields.map((f) => (
-            <div className="field" key={f}>
-              <label>{LABEL[f]?.[0] || f}</label>
-              <input type={SECRET_FIELDS.has(f) ? 'password' : 'text'} placeholder={LABEL[f]?.[1] || ''}
-                value={values[f] || ''} onChange={(e) => set(f, e.target.value)} />
-            </div>
-          ))}
-          {isOAuth && <div className="hint">Opens the {platform} consent screen. Requires the registered OAuth app.</div>}
-          {error && <div className="hint" style={{ color: 'var(--red)' }}>{error}</div>}
-          <button className="btn primary block" disabled={busy} onClick={save}>
-            {busy ? 'Connecting…' : isOAuth ? `Authorize ${platform}` : 'Connect'}
-          </button>
-        </>
-      )}
-    </div>
-  );
-}
-
-export function ConnectStep({ project, connections, onRefresh }) {
-  const src = connections.find((c) => c.side === 'source');
-  const tgt = connections.find((c) => c.side === 'target');
-  return (
-    <div className="card">
-      <h2>Connect your platforms</h2>
-      <p className="hint">One admin credential per side. We store it encrypted and use it only through official APIs.</p>
-      <div className="row" style={{ alignItems: 'stretch' }}>
-        <ConnectCard projectId={project._id} side="source" platform={project.source.platform} connection={src} onChanged={onRefresh} />
-        <div className="arrow">→</div>
-        <ConnectCard projectId={project._id} side="target" platform={project.target.platform} connection={tgt} onChanged={onRefresh} />
-      </div>
-    </div>
-  );
-}
-
 const DATA_GROUPS = [
-  ['migrateConfig', 'Configuration', 'Groups, agents, fields, SLAs, business hours, automations, macros, brands'],
-  ['migrateData', 'Data', 'Tickets + conversations + attachments, contacts, companies, knowledge base, CSAT'],
+  ['migrateConfig', 'config', 'Configuration', 'Groups, agents, fields, SLAs, business hours, automations, macros, brands'],
+  ['migrateData', 'data', 'Data', 'Tickets + conversations + attachments, contacts, companies, knowledge base'],
 ];
-export function Configure({ options, setOptions }) {
+
+// Step 3 — Select data. Toggles for Configuration / Data, plus the live source
+// scan showing how much was picked up and what will migrate.
+export function Configure({ options, setOptions, scan, scanning }) {
+  const domainTotal = (domain) => scan ? (domain === 'config' ? scan.totals.config : scan.totals.data) : null;
   return (
-    <div className="card">
-      <h2>What to migrate</h2>
-      <p className="hint">Select the scope. Configuration is migrated before data so tickets can reference the new groups, agents and fields.</p>
-      <div className="toggle-list">
-        {DATA_GROUPS.map(([k, t, d]) => (
-          <label className="toggle" key={k}>
-            <input type="checkbox" checked={options[k]} onChange={(e) => setOptions({ ...options, [k]: e.target.checked })} />
-            <span><span className="t">{t}</span><br /><span className="d">{d}</span></span>
-          </label>
-        ))}
+    <>
+      <div className="card">
+        <h2>Select Data</h2>
+        <p className="hint">Choose the scope. Configuration migrates before data so tickets can reference the new groups, agents and fields.</p>
+        <div className="toggle-list">
+          {DATA_GROUPS.map(([k, domain, t, d]) => {
+            const n = domainTotal(domain);
+            return (
+              <label className="toggle" key={k}>
+                <input type="checkbox" checked={options[k]} onChange={(e) => setOptions({ ...options, [k]: e.target.checked })} />
+                <span>
+                  <span className="t">{t}{n != null && <span className="count-badge">{n.toLocaleString()} ready</span>}</span>
+                  <br /><span className="d">{d}</span>
+                </span>
+              </label>
+            );
+          })}
+        </div>
       </div>
-    </div>
+
+      <div className="card">
+        <h2>Picked up from source</h2>
+        <p className="hint">{scanning ? 'Scanning the source help desk…' : 'Live counts read from the source. Rows in a disabled scope won’t migrate.'}</p>
+        {scanning && <div className="scan-loading"><span className="spin" /> Reading source data…</div>}
+        {!scanning && !scan && <p className="empty">Source scan unavailable.</p>}
+        {!scanning && scan && (
+          <table className="matrix">
+            <thead><tr><th>Source object</th><th>→ Destination</th><th>Scope</th><th className="num">Ready to migrate</th></tr></thead>
+            <tbody>
+              {scan.rows.map((r) => {
+                const on = r.domain === 'config' ? options.migrateConfig : options.migrateData;
+                return (
+                  <tr key={r.type} className={on ? '' : 'row-off'}>
+                    <td>{r.type}</td><td>{r.targetType}</td><td><span className="dom">{r.domain}</span></td>
+                    <td className="num">{on ? r.count.toLocaleString() : '—'}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </>
   );
 }
 
@@ -163,18 +91,21 @@ export function MatrixTable({ rows }) {
   return (
     <div className="card">
       <h2>Object mapping &amp; progress</h2>
-      <p className="hint">Every source object → destination object, coloured by feasibility.</p>
+      <p className="hint">Every source object → the destination object it becomes, with counts and progress.</p>
       <table className="matrix">
-        <thead><tr><th>Source</th><th>→ Destination</th><th>Scope</th><th>Feasibility</th><th className="num">Src</th><th>Progress</th><th className="num">Manual</th><th className="num">Failed</th></tr></thead>
+        <thead><tr><th>Source</th><th>→ Destination</th><th>Scope</th><th className="num">Picked up</th><th className="num">Will migrate</th><th>Progress</th><th className="num">Manual</th><th className="num">Failed</th></tr></thead>
         <tbody>
           {rows.map((r) => {
-            const pct = r.source ? Math.round((r.migrated / r.source) * 100) : 0;
+            // Dry run marks entities 'validated'; live marks them 'loaded'. Only
+            // one is ever non-zero, so their sum is the "done" count either way.
+            const done = (r.migrated || 0) + (r.validated || 0);
+            const pct = r.source ? Math.round((done / r.source) * 100) : 0;
             return (
               <tr key={r.type}>
                 <td>{r.type}</td><td>{r.targetType}</td><td><span className="dom">{r.domain}</span></td>
-                <td><span className={`pill ${r.feasibility}`}>{r.feasibility}</span></td>
                 <td className="num">{r.source}</td>
-                <td><div className="bar"><i style={{ width: `${pct}%` }} /></div><span className="dom">{r.migrated}/{r.source}</span></td>
+                <td className="num">{done}</td>
+                <td><div className="bar"><i style={{ width: `${pct}%` }} /></div><span className="dom">{done}/{r.source}</span></td>
                 <td className="num">{r.manual}</td><td className="num">{r.failed}</td>
               </tr>
             );
@@ -185,22 +116,92 @@ export function MatrixTable({ rows }) {
   );
 }
 
-export function Conflicts({ items }) {
+// A big circular percentage ring (CSS conic-gradient) used on the in-progress
+// screens for both the dry run and the live migration.
+function Ring({ pct, label }) {
+  const p = Math.max(0, Math.min(100, Math.round(pct || 0)));
+  return (
+    <div className="ring" style={{ '--pct': p }}>
+      <div className="ring-in"><div className="ring-pct">{p}%</div><div className="ring-lbl">{label}</div></div>
+    </div>
+  );
+}
+
+// In-progress dashboard for the running dry run / live migration.
+export function Progress({ report, matrix, mode }) {
+  const t = report?.totals || {};
+  const rows = matrix || [];
+  const source = t.source ?? rows.reduce((a, r) => a + (r.source || 0), 0);
+  const done = (t.migrated || 0) + (t.validated || 0) || rows.reduce((a, r) => a + (r.migrated || 0) + (r.validated || 0), 0);
+  const manual = t.manual ?? rows.reduce((a, r) => a + (r.manual || 0), 0);
+  const failed = t.failed ?? rows.reduce((a, r) => a + (r.failed || 0), 0);
+  const pct = source ? ((done + manual + failed) / source) * 100 : 0;
+  const cells = [
+    ['Objects', source, ''],
+    [mode === 'dry' ? 'Would migrate' : 'Migrated', done, 'green'],
+    ['Manual', manual, 'amber'],
+    ['Errors', failed, 'red'],
+  ];
   return (
     <div className="card">
-      <h2>⚙ Configuration automation &amp; checklist</h2>
-      <p className="hint">Auto-migrated where an API exists; an exact checklist for the few items the destination locks behind its admin UI.</p>
-      <div className="conflicts">
-        {(!items || !items.length) && <p className="empty">Run a pre-check to see configuration results.</p>}
-        {items && items.map((c, i) => (
-          <div className={`conflict ${c.kind}`} key={i}>
-            <div className="k">{(c.kind || '').replace(/_/g, ' ')}</div>
-            <div className="d">{c.detail}</div>
-            {c.suggestion && <div className="s">→ {c.suggestion}</div>}
-          </div>
-        ))}
+      <h2>{mode === 'dry' ? 'Dry Run in Progress' : 'Migration in Progress'}</h2>
+      <p className="hint">Watch the activity log below for live updates. {mode === 'dry' ? 'No data is written during a dry run.' : 'Configuration loads first, then data.'}</p>
+      <div className="progress-hero">
+        <Ring pct={pct} label="Progress" />
+        <div className="progress-cells">
+          {cells.map(([l, n, c]) => <div className={`kpi ${c}`} key={l}><div className="n">{(n ?? 0).toLocaleString()}</div><div className="l">{l}</div></div>)}
+        </div>
       </div>
     </div>
+  );
+}
+
+// The "Dry Run Complete" summary screen — big-number cards, a one-line
+// pre-flight verdict, the object mapping, and the go-live action.
+export function DryRunSummary({ report, matrix, onGoLive, running }) {
+  const t = report?.totals || {};
+  const rows = (report?.byType?.length ? report.byType : matrix) || [];
+  const source = t.source ?? rows.reduce((a, r) => a + (r.source || 0), 0);
+  const would = (t.validated || 0) + (t.migrated || 0) || rows.reduce((a, r) => a + (r.validated || 0) + (r.migrated || 0), 0);
+  const manual = t.manual ?? rows.reduce((a, r) => a + (r.manual || 0), 0);
+  const failed = t.failed ?? rows.reduce((a, r) => a + (r.failed || 0), 0);
+  const objectTypes = rows.filter((r) => r.source > 0).length;
+  const blockers = failed;
+  const ready = failed === 0;
+  const cells = [
+    ['Object types', objectTypes, ''],
+    ['Total objects', source, 'blue'],
+    ['Would migrate', would, 'green'],
+    ['Manual', manual, 'amber'],
+    ['Errors', failed, 'red'],
+  ];
+  return (
+    <>
+      <div className="card dryrun-hero">
+        <div className="dryrun-check">◎</div>
+        <h2>Dry Run Complete</h2>
+        <p className="hint" style={{ textAlign: 'center' }}>Pre-check complete — no data was written.</p>
+        <div className="kpis kpis-5">
+          {cells.map(([l, n, c]) => <div className={`kpi ${c}`} key={l}><div className="n">{(n ?? 0).toLocaleString()}</div><div className="l">{l}</div></div>)}
+        </div>
+      </div>
+
+      <div className={`card preflight ${ready ? 'ok' : 'warn'}`}>
+        <div className="preflight-head">
+          <b>🔍 Dry-Run Pre-Flight Report</b>
+          <span>{objectTypes} ready · {manual} manual · {blockers} blocker{blockers === 1 ? '' : 's'}</span>
+        </div>
+        <p className="hint" style={{ margin: '6px 0 0' }}>
+          {ready ? 'All checks passed. Safe to go live.' : `${blockers} object(s) failed validation — review the errors below before going live.`}
+        </p>
+      </div>
+
+      {!!rows.length && <MatrixTable rows={rows} />}
+
+      <button className="btn primary block lg" disabled={running} onClick={onGoLive}>
+        {running ? 'Starting…' : '🚀 Start Migration (Live)'}
+      </button>
+    </>
   );
 }
 
@@ -238,7 +239,6 @@ export function Report({ report, conflicts, projectId }) {
       <Kpis totals={report.totals} />
       <MatrixTable rows={report.byType.map((b) => ({ ...b, targetType: b.targetType || '' }))} />
       <RoleMapping rows={report.roleMapping} />
-      <Conflicts items={conflicts} />
       <div className="card">
         <h2>Export</h2>
         <p className="hint">One Excel workbook — a tab each for Summary, Totals, Failures (with reasons), Logs, Config checklist, and Role mapping.</p>

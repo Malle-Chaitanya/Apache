@@ -7,17 +7,20 @@ import { mapAgentRole } from '../mapping/valueMaps.js';
 export async function reconcile(ctx) {
   const { project } = ctx;
   const byType = [];
-  let totals = { source: 0, migrated: 0, manual: 0, failed: 0 };
+  let totals = { source: 0, migrated: 0, validated: 0, manual: 0, failed: 0 };
 
   for (const type of LOAD_ORDER) {
     const q = { projectId: project._id };
     const source = await repo(type).count(q);
     if (!source) continue;
     const migrated = await repo(type).count({ ...q, status: 'loaded' });
+    // In a dry run the loader marks entities 'validated' instead of creating
+    // them — this is the "would migrate" count surfaced in the pre-check.
+    const validated = await repo(type).count({ ...q, status: 'validated' });
     const manual = await repo(type).count({ ...q, status: 'manual' });
     const failed = await repo(type).count({ ...q, status: 'failed' });
-    byType.push({ type, domain: MATRIX[type].domain, feasibility: MATRIX[type].feasibility, source, migrated, manual, failed });
-    totals.source += source; totals.migrated += migrated; totals.manual += manual; totals.failed += failed;
+    byType.push({ type, domain: MATRIX[type].domain, feasibility: MATRIX[type].feasibility, source, migrated, validated, manual, failed });
+    totals.source += source; totals.migrated += migrated; totals.validated += validated; totals.manual += manual; totals.failed += failed;
   }
 
   const commentQ = { projectId: project._id };

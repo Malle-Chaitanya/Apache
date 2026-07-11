@@ -5,7 +5,7 @@ import { runMigration } from '../engine/orchestrator.js';
 import { MATRIX, LOAD_ORDER } from '../mapping/matrix.js';
 import { connectionManager } from '../auth/connectionManager.js';
 import { requireAuth, login as portalLogin } from '../auth/appAuth.js';
-import { sourcePlatforms, targetPlatforms } from '../connectors/registry.js';
+import { sourcePlatforms, targetPlatforms, makeSource } from '../connectors/registry.js';
 import { log } from '../lib/logger.js';
 
 export function apiRouter() {
@@ -122,6 +122,10 @@ export function apiRouter() {
   // ── Run + monitor ──
   r.post('/projects/:id/run', async (req, res) => {
     const dryRun = !!(req.body && req.body.dryRun);
+    // Flip to 'running' synchronously so the next status poll never reads the
+    // previous run's terminal status (e.g. a dry run's 'completed') and mistakes
+    // this fresh run for one that already finished.
+    await repo('projects').updateOne({ _id: req.params.id }, { status: 'running', currentPhase: 'connect' });
     runMigration(req.params.id, { dryRun }).catch((e) => log.error(`run error: ${e.message}`));
     res.status(202).json({ started: true, dryRun });
   });
@@ -131,9 +135,31 @@ export function apiRouter() {
       const m = MATRIX[type];
       rows.push({ type, domain: m.domain, targetType: m.targetType, feasibility: m.feasibility,
         source: await repo(type).count({ projectId: id }), migrated: await repo(type).count({ projectId: id, status: 'loaded' }),
+        validated: await repo(type).count({ projectId: id, status: 'validated' }),
         manual: await repo(type).count({ projectId: id, status: 'manual' }), failed: await repo(type).count({ projectId: id, status: 'failed' }) });
     }
     res.json(rows);
+  });
+
+  // Source scan — reads live counts from the source (the same discover() the
+  // orchestrator runs) so "Select data" can show how much is picked up and what
+  // will migrate, before any dry run. Mapped through MATRIX for target/domain.
+  r.get('/projects/:id/scan', async (req, res, next) => {
+    try {
+      const p = req.project;
+      const creds = await connectionManager.get(p._id, 'source');
+      const source = makeSource(p.source.platform, creds.connectorCreds);
+      const counts = await source.discover();
+      const rows = [];
+      let config = 0, data = 0;
+      for (const type of LOAD_ORDER) {
+        const m = MATRIX[type];
+        const count = counts[type] || 0;
+        rows.push({ type, targetType: m.targetType, domain: m.domain, count });
+        if (m.domain === 'config') config += count; else data += count;
+      }
+      res.json({ rows, totals: { config, data, all: config + data } });
+    } catch (e) { next(e); }
   });
   r.get('/projects/:id/report', async (req, res) => { const rep = await repo('reports').findOne({ projectId: req.params.id }); res.json(rep?.summary || null); });
   r.get('/projects/:id/conflicts', async (req, res) => res.json(await repo('conflicts').find({ projectId: req.params.id })));

@@ -48,7 +48,9 @@ export class HttpClient {
 
 export class HttpError extends Error {
   constructor(status, body, url) {
-    super(`HTTP ${status} at ${url}`);
+    // Include the API's response body so logs/exports show WHY (not just the status).
+    const detail = body == null ? '' : (typeof body === 'string' ? body : JSON.stringify(body));
+    super(`HTTP ${status} at ${url}${detail ? ' — ' + detail.slice(0, 400) : ''}`);
     this.status = status;
     this.body = body;
     this.url = url;

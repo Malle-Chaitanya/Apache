@@ -21,10 +21,13 @@ services:
     environment:
       PORT: 4400
       STORE: mongo
-      # Credentialed URI (authSource=admin: root user lives in admin). Passwords
-      # with special chars (@ : / etc.) must be percent-encoded here, so we take
-      # the full URI from .env; the literal password below feeds the DB itself.
-      MONGODB_URI: ${MONGODB_URI:-mongodb://itsm:changeme@mongodb:27017/itsm_migrator?authSource=admin}
+      # In-network Mongo parts (the app URL-encodes the password itself, so no
+      # %40 juggling). Local dev overrides only MONGO_HOST/PORT via .env.
+      MONGO_HOST: mongodb
+      MONGO_PORT: "27017"
+      MONGO_USERNAME: ${MONGO_USERNAME:-itsm}
+      MONGO_PASSWORD: ${MONGO_PASSWORD:-changeme}
+      MONGO_DATABASE: ${MONGO_DATABASE:-itsm_migrator}
       SECRET_BACKEND: mongo
       MIGRATION_SECRET_KEY: ${MIGRATION_SECRET_KEY:-Hg4oV9EYYu/kYgUUp6EX1CqTV9ur0lGIuD1xDQgKbgI=}
       JWT_SECRET: ${JWT_SECRET:-29a1dbedaf37a3192bbbae8f585b17155f94efd9a4bd5fc8}

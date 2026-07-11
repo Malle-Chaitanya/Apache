@@ -2,33 +2,42 @@ import React, { useEffect, useRef, useState } from 'react';
 import { api, auth } from './api.js';
 import Login from './Login.jsx';
 import Logo from './Logo.jsx';
-import PlatformLogo from './PlatformLogo.jsx';
-import { Stepper, ReauthBanner, Configure, Kpis, MatrixTable, Conflicts, Log, Report } from './steps.jsx';
-import { ManageClouds, AccountPicker, ConnectSummary } from './Clouds.jsx';
+import { Stepper, ReauthBanner, Configure, Kpis, MatrixTable, Log, Report, Progress, DryRunSummary } from './steps.jsx';
+import { ConnectPlatforms, PairPicker } from './Clouds.jsx';
 
+// The migration steps, in the order a real migration runs.
 const STEPS = [
-  { key: 'connect', label: 'Connect' },
-  { key: 'configure', label: 'Select data' },
-  { key: 'precheck', label: 'Pre-check' },
-  { key: 'migrate', label: 'Migrate' },
+  { key: 'connect', label: 'Connect Platforms' },
+  { key: 'pair', label: 'Choose Pair' },
+  { key: 'select', label: 'Select Data' },
+  { key: 'precheck', label: 'Dry Run' },
+  { key: 'migrate', label: 'Live Migration' },
   { key: 'report', label: 'Report' },
 ];
+const idx = (k) => STEPS.findIndex((s) => s.key === k);
+const cap = (s) => (s ? s[0].toUpperCase() + s.slice(1) : s);
 
 export default function App() {
   const [booting, setBooting] = useState(true);
   const [user, setUser] = useState(null);
   const [config, setConfig] = useState(null);
   const [accounts, setAccounts] = useState([]);
-  const [view, setView] = useState('wizard');       // wizard | clouds
   const [project, setProject] = useState(null);
   const [step, setStep] = useState(0);
+  const [pair, setPair] = useState({ sourceAccountId: '', targetAccountId: '' });
+  const [options, setOptions] = useState({ migrateConfig: true, migrateData: true });
+  const [scan, setScan] = useState(null);
+  const [scanning, setScanning] = useState(false);
   const [matrix, setMatrix] = useState([]);
   const [report, setReport] = useState(null);
   const [conflicts, setConflicts] = useState([]);
   const [events, setEvents] = useState([]);
-  const [options, setOptions] = useState({ migrateConfig: true, migrateData: true });
   const [running, setRunning] = useState(false);
+  const [dryDone, setDryDone] = useState(false);
+  const [liveDone, setLiveDone] = useState(false);
   const poll = useRef(null);
+  const runModeRef = useRef(null);   // 'dry' | 'live' — read inside the poll closure
+  const armedRef = useRef(false);    // have we observed THIS run actually running yet?
 
   useEffect(() => {
     (async () => {
@@ -36,7 +45,6 @@ export default function App() {
       if (auth.token()) {
         try {
           setUser(await api.me());
-          // OAuth return: Zendesk/Jira redirect back to the app with ?code&state.
           const q = new URLSearchParams(window.location.search);
           if (q.get('code') && q.get('state')) {
             try { await api.completeOAuth(q.get('code'), q.get('state')); } catch { /* surfaced via account status */ }
@@ -52,145 +60,175 @@ export default function App() {
 
   const refreshAccounts = async () => { try { setAccounts(await api.listAccounts()); } catch { /* ignore */ } };
 
-  // While connecting (or managing clouds), poll accounts to catch OAuth callbacks.
+  const sources = config?.sources || ['zendesk'];
+  const targets = config?.targets || ['freshdesk'];
+  const connectedFor = (list) => accounts.filter((a) => list.includes(a.platform) && a.status === 'connected');
+  const srcConnected = connectedFor(sources);
+  const tgtConnected = connectedFor(targets);
+  const key = STEPS[step].key;
+
+  // Poll accounts while on the connect step so OAuth callbacks land.
   useEffect(() => {
-    if (!user) return;
-    if (view !== 'clouds' && !(project && STEPS[step].key === 'connect')) return;
+    if (!user || key !== 'connect') return;
     const id = setInterval(refreshAccounts, 2500);
     return () => clearInterval(id);
-  }, [user, view, project, step]);
+  }, [user, key]);
+
+  // Default the pair selection to the single connected account per side.
+  useEffect(() => {
+    if (key !== 'pair') return;
+    setPair((prev) => ({
+      sourceAccountId: prev.sourceAccountId || (srcConnected.length === 1 ? srcConnected[0]._id : ''),
+      targetAccountId: prev.targetAccountId || (tgtConnected.length === 1 ? tgtConnected[0]._id : ''),
+    }));
+  }, [key, accounts]);
+
+  // Scan the source once we land on Select Data with a project.
+  useEffect(() => {
+    if (key !== 'select' || !project || scan || scanning) return;
+    (async () => {
+      setScanning(true);
+      try { setScan(await api.scan(project._id)); } catch { setScan(null); }
+      setScanning(false);
+    })();
+  }, [key, project]);
 
   async function refreshRun() {
     const id = project._id;
     const [p, m, r, c, e] = await Promise.all([api.getProject(id), api.matrix(id), api.report(id), api.conflicts(id), api.events(id)]);
     setProject(p); setMatrix(m); setReport(r); setConflicts(c); setEvents(e);
-    if (['completed', 'failed', 'reauth_required'].includes(p.status)) {
-      clearInterval(poll.current); setRunning(false);
-      if (p.status === 'reauth_required') refreshAccounts();
-    }
+    const terminal = ['completed', 'failed', 'reauth_required'].includes(p.status);
+    // Once we've seen the run actually running, a terminal status means done.
+    // Until then, ignore a terminal status left over from a PREVIOUS run — this
+    // is what makes the dry-run → live-run transition show live progress instead
+    // of the previous run's finished/report view.
+    if (!terminal) { armedRef.current = true; return; }
+    if (!armedRef.current) return;
+    clearInterval(poll.current); setRunning(false);
+    if (p.status === 'completed') { if (runModeRef.current === 'dry') setDryDone(true); if (runModeRef.current === 'live') setLiveDone(true); }
+    if (p.status === 'reauth_required') refreshAccounts();
   }
   function startRun(dryRun) {
-    setRunning(true);
+    setRunning(true); runModeRef.current = dryRun ? 'dry' : 'live'; armedRef.current = false;
+    if (dryRun) setDryDone(false); else setLiveDone(false);
     api.run(project._id, dryRun).catch(() => {});
     clearInterval(poll.current);
     poll.current = setInterval(refreshRun, 1000);
   }
-  function resetToNew() {
-    clearInterval(poll.current); setRunning(false); setView('wizard');
-    setProject(null); setStep(0); setReport(null); setConflicts([]); setEvents([]); setMatrix([]);
+
+  function clearRunState() {
+    clearInterval(poll.current); setRunning(false);
+    runModeRef.current = null; armedRef.current = false;
+    setDryDone(false); setLiveDone(false);
+    setMatrix([]); setReport(null); setConflicts([]); setEvents([]); setScan(null);
   }
-  function signOut() { resetToNew(); auth.logout(); setUser(null); setAccounts([]); }
+  function resetToStart() {
+    clearRunState(); setProject(null); setPair({ sourceAccountId: '', targetAccountId: '' }); setStep(0);
+  }
+  function signOut() { resetToStart(); auth.logout(); setUser(null); setAccounts([]); }
+
+  // pair → select: create the project silently, bound to the chosen accounts.
+  async function goToSelect() {
+    const srcAcct = accounts.find((a) => a._id === pair.sourceAccountId);
+    const tgtAcct = accounts.find((a) => a._id === pair.targetAccountId);
+    const needNew = !project || project.source?.accountId !== pair.sourceAccountId || project.target?.accountId !== pair.targetAccountId;
+    if (needNew) {
+      clearRunState();
+      const name = `${cap(srcAcct?.platform)} → ${cap(tgtAcct?.platform)}`;
+      const p = await api.createProject({ name, source: { accountId: pair.sourceAccountId }, target: { accountId: pair.targetAccountId } });
+      setProject(p);
+    }
+    setStep(idx('select'));
+  }
 
   if (booting) return null;
   if (!user) return <Login onLogin={async (u) => { setUser(u); setAccounts(await api.listAccounts()); }} />;
 
-  const platforms = [...new Set([...(config?.sources || []), ...(config?.targets || [])])];
   const acctFor = (side) => accounts.find((a) => a._id === project?.[side]?.accountId);
-  const bothConnected = acctFor('source')?.status === 'connected' && acctFor('target')?.status === 'connected';
-  const key = STEPS[step].key;
-  const boundForBanner = project ? ['source', 'target'].map((side) => { const a = acctFor(side); return a ? { side, platform: a.platform, status: a.status } : null; }).filter(Boolean) : [];
+  const boundForBanner = project
+    ? ['source', 'target'].map((side) => { const a = acctFor(side); return a ? { side, platform: a.platform, status: a.status } : null; }).filter(Boolean)
+    : [];
+  const statusText = running ? 'Running' : project ? cap(project.status) : 'Idle';
+  const statusPill = running ? 'running' : project?.status === 'completed' ? 'completed' : 'idle';
 
   const topbar = (
     <header className="topbar">
       <div className="brand"><Logo color="#ffffff" height={30} /><div><p>ITSM migration · data + configuration</p></div></div>
       <div className="proj">
-        {project && <><b>{project.name}</b> · {project.source.platform} → {project.target.platform} · <span className={`pill ${project.status === 'completed' ? 'connected' : project.status}`}>{project.status}</span> · </>}
-        <button className="btn ghost" onClick={() => setView(view === 'clouds' ? 'wizard' : 'clouds')}>☁ Clouds</button>
-        {project && <button className="btn ghost" onClick={resetToNew}>New migration</button>}
+        <span className={`pill ${statusPill}`}>{statusText}</span>
         <span className="who">{user.name}</span>
+        <button className="btn ghost" onClick={resetToStart}>↺ Reset</button>
         <button className="btn ghost" onClick={signOut}>Sign out</button>
       </div>
     </header>
   );
 
-  if (view === 'clouds') {
-    return <>{topbar}<main><ManageClouds accounts={accounts} platforms={platforms} onRefresh={refreshAccounts} /></main></>;
-  }
-
-  if (!project) {
-    return <>{topbar}<NewMigration config={config} accounts={accounts} onRefreshAccounts={refreshAccounts} onCreate={async (body) => {
-      const p = await api.createProject(body); setProject(p); setStep(0); await refreshAccounts();
-    }} /></>;
-  }
+  // Bottom action bar: the Next button, gated per step. precheck / migrate drive
+  // their primary action inline (Start dry run / Go live / Start migration).
+  const nextButton = () => {
+    if (key === 'connect') {
+      const ok = srcConnected.length > 0 && tgtConnected.length > 0;
+      return <button className="btn primary" disabled={!ok} onClick={() => setStep(idx('pair'))}>{ok ? 'Continue →' : 'Connect both sides to continue'}</button>;
+    }
+    if (key === 'pair') {
+      const ok = pair.sourceAccountId && pair.targetAccountId;
+      return <button className="btn primary" disabled={!ok} onClick={goToSelect}>{ok ? 'Continue →' : 'Select both accounts'}</button>;
+    }
+    if (key === 'select') {
+      const ok = options.migrateConfig || options.migrateData;
+      return <button className="btn primary" disabled={!ok} onClick={() => setStep(idx('precheck'))}>{ok ? 'Continue to dry run →' : 'Select at least one scope'}</button>;
+    }
+    if (key === 'migrate' && liveDone) {
+      return <button className="btn primary" onClick={() => setStep(idx('report'))}>View report →</button>;
+    }
+    return null;
+  };
 
   return (
     <>
       {topbar}
       <main>
         <Stepper steps={STEPS} current={step} />
-        <ReauthBanner connections={boundForBanner} onReconnect={() => setStep(0)} />
+        <ReauthBanner connections={boundForBanner} onReconnect={() => setStep(idx('connect'))} />
 
-        {key === 'connect' && <ConnectSummary project={project} accounts={accounts} onRefresh={refreshAccounts} />}
-        {key === 'configure' && <Configure options={options} setOptions={setOptions} />}
-        {key === 'precheck' && (<>
-          <div className="card"><h2>Pre-check (dry run)</h2><p className="hint">Reads both platforms and produces the full mapping preview + conflict list. No data is written.</p>
-            <button className="btn primary" disabled={running} onClick={() => startRun(true)}>{running ? 'Analyzing…' : '▶ Run pre-check'}</button></div>
-          {!!matrix.length && <MatrixTable rows={matrix} />}
-          <Conflicts items={conflicts} />
-        </>)}
-        {key === 'migrate' && (<>
-          <div className="card"><h2>Run migration</h2><p className="hint">Configuration loads first, then data — batched, checkpointed, resumable. IDs are re-mapped so relationships stay intact.</p>
-            <button className="btn primary lg" disabled={running} onClick={() => startRun(false)}>{running ? 'Migrating…' : '▶ Start migration'}</button></div>
-          <Kpis totals={report?.totals} />
-          {!!matrix.length && <MatrixTable rows={matrix} />}
-          <Log events={events} />
-        </>)}
-        {key === 'report' && <Report report={report} conflicts={conflicts} projectId={project._id} />}
+        {key === 'connect' && <ConnectPlatforms accounts={accounts} sources={sources} targets={targets} onRefresh={refreshAccounts} />}
+
+        {key === 'pair' && <PairPicker accounts={accounts} sources={sources} targets={targets} value={pair} onChange={setPair} />}
+
+        {key === 'select' && <Configure options={options} setOptions={setOptions} scan={scan} scanning={scanning} />}
+
+        {key === 'precheck' && (running ? (
+          <><Progress report={report} matrix={matrix} mode="dry" /><Log events={events} /></>
+        ) : dryDone ? (
+          <><DryRunSummary report={report} matrix={matrix} running={running} onGoLive={() => { setStep(idx('migrate')); startRun(false); }} /><Log events={events} /></>
+        ) : (
+          <div className="card">
+            <h2>Dry Run (Pre-check)</h2>
+            <p className="hint">A dry run reads both platforms and previews exactly what would migrate — no data is written. Recommended before the first live migration.</p>
+            <button className="btn primary lg" onClick={() => startRun(true)}>🔍 Start Dry Run</button>
+          </div>
+        ))}
+
+        {key === 'migrate' && (running ? (
+          <><Progress report={report} matrix={matrix} mode="live" /><Log events={events} /></>
+        ) : liveDone ? (
+          <><Kpis totals={report?.totals} />{!!matrix.length && <MatrixTable rows={matrix} />}<Log events={events} /></>
+        ) : (
+          <div className="card">
+            <h2>Live Migration</h2>
+            <p className="hint">Configuration loads first, then data — batched, checkpointed, resumable. IDs are re-mapped so relationships stay intact.</p>
+            <button className="btn primary lg" onClick={() => startRun(false)}>🚀 Start Migration (Live)</button>
+          </div>
+        ))}
+
+        {key === 'report' && <Report report={report} conflicts={conflicts} projectId={project?._id} />}
 
         <div className="actions">
-          <button className="btn" onClick={() => (step === 0 ? resetToNew() : setStep((s) => Math.max(0, s - 1)))}>← Back</button>
+          <button className="btn" onClick={() => (step === 0 ? resetToStart() : setStep((s) => Math.max(0, s - 1)))} disabled={running}>← Back</button>
           <div className="spacer" />
-          {step < STEPS.length - 1 && (
-            <button className="btn primary" disabled={key === 'connect' && !bothConnected}
-              onClick={() => { setStep((s) => s + 1); if (STEPS[step + 1].key !== 'connect') refreshRun().catch(() => {}); }}>
-              {key === 'connect' && !bothConnected ? 'Connect both to continue' : 'Next →'}
-            </button>
-          )}
+          {nextButton()}
         </div>
       </main>
     </>
-  );
-}
-
-function NewMigration({ config, accounts, onRefreshAccounts, onCreate }) {
-  const sources = config?.sources || ['zendesk'];
-  const targets = config?.targets || ['freshdesk'];
-  const [name, setName] = useState('');
-  const [source, setSource] = useState(sources[0]);
-  const [target, setTarget] = useState(targets[0]);
-  const [sourceAccountId, setSourceAccountId] = useState('');
-  const [targetAccountId, setTargetAccountId] = useState('');
-  const ready = name.trim() && sourceAccountId && targetAccountId;
-  return (
-    <main>
-      <div className="card" style={{ maxWidth: 760, margin: '10px auto' }}>
-        <h2>New migration</h2>
-        <p className="hint">Name it, pick platforms, and choose a saved cloud account for each side (or add one — it's reused next time).</p>
-        <div className="field"><label>Project name</label><input value={name} placeholder="Name this migration" onChange={(e) => setName(e.target.value)} /></div>
-        <div className="row">
-          <div>
-            <div className="pgrid">{sources.map((p) => (
-              <div key={p} className={`ptile ${source === p ? 'sel' : ''}`} onClick={() => { setSource(p); setSourceAccountId(''); }}><div className="logo"><PlatformLogo platform={p} /></div><div className="nm">{p}</div></div>
-            ))}</div>
-            <div style={{ marginTop: 10 }}>
-              <AccountPicker label="Source" platform={source} accounts={accounts} value={sourceAccountId} onChange={setSourceAccountId} onRefresh={onRefreshAccounts} />
-            </div>
-          </div>
-          <div className="arrow">→</div>
-          <div>
-            <div className="pgrid">{targets.map((p) => (
-              <div key={p} className={`ptile ${target === p ? 'sel' : ''}`} onClick={() => { setTarget(p); setTargetAccountId(''); }}><div className="logo"><PlatformLogo platform={p} /></div><div className="nm">{p}</div></div>
-            ))}</div>
-            <div style={{ marginTop: 10 }}>
-              <AccountPicker label="Destination" platform={target} accounts={accounts} value={targetAccountId} onChange={setTargetAccountId} onRefresh={onRefreshAccounts} />
-            </div>
-          </div>
-        </div>
-        <div className="actions"><div className="spacer" />
-          <button className="btn primary lg" disabled={!ready}
-            onClick={() => onCreate({ name: name.trim(), source: { accountId: sourceAccountId }, target: { accountId: targetAccountId } })}>Create migration →</button>
-        </div>
-      </div>
-    </main>
   );
 }

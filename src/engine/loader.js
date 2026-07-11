@@ -38,7 +38,10 @@ export async function loadType(ctx, type) {
     if (dryRun) { await mark(type, ent, 'validated'); continue; }
 
     try {
-      const { id } = await target.create(meta.targetType, result.payload, result.ctxOut || {});
+      const ctxOut = result.ctxOut || {};
+      // Macro replies become canned responses, which must live in a folder.
+      if (meta.targetType === 'cannedResponses' && target.ensureCannedFolder) ctxOut.folderId = await target.ensureCannedFolder();
+      const { id } = await target.create(meta.targetType, result.payload, ctxOut);
       await writeIdmap(ctx, type, ent.sourceId, id, meta.targetType);
       await repo(type).updateOne({ _id: ent._id }, { status: 'loaded', targetId: String(id) });
       ctx.stats.migrated++;
@@ -51,6 +54,27 @@ export async function loadType(ctx, type) {
       // Auth failure = rotated/revoked credential → abort so the orchestrator
       // can pause and request reconnect (resume later from checkpoint).
       if (err.status === 401 || err.status === 403) throw err;
+      // IDEMPOTENCY: already exists on the target (re-run / prior migration) →
+      // reuse it, never duplicate. Freshdesk returns the existing id in the 409.
+      if (err.status === 409) {
+        const existingId = extractExistingId(err.body) ?? await lookupExisting(target, meta.targetType, result.payload);
+        if (existingId) {
+          await writeIdmap(ctx, type, ent.sourceId, existingId, meta.targetType, true);
+          await repo(type).updateOne({ _id: ent._id }, { status: 'loaded', targetId: String(existingId) });
+          ctx.stats.migrated++;
+          emit('load', type, `${type}#${ent.sourceId} already existed → reused #${existingId}`);
+          continue;
+        }
+      }
+      // BEST-EFFORT config (SLA / products / business hours): we attempt the API;
+      // if the plan/endpoint rejects it, it becomes a manual checklist item —
+      // not a hard failure.
+      if (target.capability(meta.targetType).bestEffort) {
+        const nm = ent.sourceRaw?.title || ent.sourceRaw?.name || ent.sourceId;
+        ctx.conflicts.push({ projectId: project._id, entityType: type, sourceId: ent.sourceId, kind: 'no_api', detail: `${type} "${nm}" couldn't be auto-created (${(err.message || '').slice(0, 120)}).`, suggestion: 'Recreate it in the Freshdesk admin UI.', status: 'manual' });
+        await mark(type, ent, 'manual'); ctx.stats.manual++;
+        continue;
+      }
       await mark(type, ent, 'failed', err.message);
       ctx.stats.failed++;
       emit('load', type, `load failed for ${type}#${ent.sourceId}: ${err.message}`, 'error');
@@ -99,12 +123,33 @@ function buildCtx(ctx, type) {
   };
 }
 
-async function writeIdmap(ctx, entityType, sourceId, targetId, targetType) {
+async function writeIdmap(ctx, entityType, sourceId, targetId, targetType, preexisting = false) {
   ctx.idCache.set(`${entityType}:${sourceId}`, targetId);
   await repo('idmap').upsert(
     { projectId: ctx.project._id, entityType, sourceId },
-    { projectId: ctx.project._id, entityType, sourceId, targetId: String(targetId), targetType },
+    { projectId: ctx.project._id, entityType, sourceId, targetId: String(targetId), targetType, preexisting },
   );
+}
+
+// Pull the existing record's id out of a Freshdesk 409 duplicate error, so we
+// can reuse it instead of creating a duplicate.
+function extractExistingId(body) {
+  const errs = body && body.errors;
+  if (!Array.isArray(errs)) return null;
+  for (const e of errs) {
+    const info = e.additional_info || {};
+    for (const k of ['group_id', 'agent_id', 'company_id', 'contact_id', 'user_id', 'id']) if (info[k]) return info[k];
+  }
+  return null;
+}
+
+// Fallback lookup when the 409 body doesn't carry the id.
+async function lookupExisting(target, targetType, payload) {
+  try {
+    if (targetType === 'contacts' && payload.email && target.findContactByEmail) return (await target.findContactByEmail(payload.email))?.id ?? null;
+    if (targetType === 'companies' && payload.name && target.findCompanyByName) return (await target.findCompanyByName(payload.name))?.id ?? null;
+  } catch { /* ignore */ }
+  return null;
 }
 
 async function mark(type, ent, status, message) {

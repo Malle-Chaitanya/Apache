@@ -170,3 +170,60 @@ table.matrix { width: 100%; border-collapse: collapse; font-size: 12.5px; }
 .login-card .field input { background: #f4f6fb; height: 46px; }
 .login-err { background: var(--redBg); color: var(--red); border-radius: 6px; padding: 8px 10px; font-size: 12.5px; margin-bottom: 12px; }
 .login-card .btn.lg { height: 48px; }
+
+/* ── Connect Platforms: tabs ── */
+.tabs { display: flex; gap: 18px; border-bottom: 1px solid var(--line); margin-top: 12px; }
+.tab { border: none; background: none; padding: 10px 2px; font-weight: 600; font-size: 14px; color: var(--muted);
+  cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -1px; }
+.tab.active { color: var(--brand); border-bottom-color: var(--brand); }
+.tab-check { color: var(--green); margin-left: 4px; }
+
+/* Platform connect cards ("N accounts connected" / + Add Another) */
+.pcards { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; margin-top: 6px; }
+.pcard { border: 1px solid var(--line); border-radius: 12px; padding: 20px; background: #fff; }
+.pcard-head { display: flex; flex-direction: column; align-items: center; gap: 8px; text-align: center; }
+.pcard .logo { width: 46px; height: 46px; border-radius: 12px; overflow: hidden; display: grid; place-items: center; color: #fff; font-weight: 700; }
+.pcard .logo svg { width: 100%; height: 100%; display: block; }
+.pcard .logo:has(svg) { background: transparent; }
+.pcard-meta .side { font-size: 11px; text-transform: uppercase; letter-spacing: .6px; color: var(--faint); }
+.pcard-meta .name { font-weight: 600; font-size: 16px; text-transform: capitalize; color: var(--brand); }
+.pcard-count { text-align: center; font-size: 12.5px; color: var(--muted); margin: 12px 0 14px; }
+.pcard-count.ok { color: var(--green); font-weight: 600; }
+.pcard-form { margin-top: 14px; border-top: 1px solid var(--line2); padding-top: 14px; }
+
+/* ── Choose Pair ── */
+.pair-row { display: flex; gap: 16px; align-items: stretch; }
+.pair-card { flex: 1; border: 1px solid var(--line); border-radius: 12px; padding: 18px 18px 20px; position: relative; }
+.pair-tag { font-size: 11px; letter-spacing: .6px; text-transform: uppercase; color: var(--faint); margin-bottom: 12px; }
+.pair-card .pill { position: absolute; top: 16px; right: 16px; }
+.pair-card .platform { margin-bottom: 12px; }
+@media (max-width: 720px){ .pair-row { flex-direction: column; } .pair-card .pill { position: static; margin-top: 8px; } }
+
+/* ── Select data: scan counts ── */
+.count-badge { display: inline-block; margin-left: 8px; background: var(--greenBg); color: var(--green);
+  font-size: 11px; font-weight: 600; padding: 1px 8px; border-radius: 999px; }
+.scan-loading { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 13px; padding: 6px 0; }
+.spin { width: 16px; height: 16px; border: 2px solid var(--line); border-top-color: var(--brand); border-radius: 50%; animation: spin .8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.matrix tr.row-off td { color: var(--faint); }
+
+/* ── Progress (in-progress dry run / live migration) ── */
+.progress-hero { display: flex; gap: 30px; align-items: center; flex-wrap: wrap; }
+.progress-cells { flex: 1; display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; min-width: 260px; }
+.ring { width: 150px; height: 150px; border-radius: 50%; flex: none; display: grid; place-items: center;
+  background: conic-gradient(var(--brand) calc(var(--pct) * 1%), var(--line2) 0); }
+.ring-in { width: 116px; height: 116px; border-radius: 50%; background: #fff; display: grid; place-items: center; text-align: center; }
+.ring-pct { font-size: 26px; font-weight: 700; color: var(--brand); }
+.ring-lbl { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; }
+@media (max-width: 640px){ .progress-hero { justify-content: center; } .progress-cells { grid-template-columns: 1fr 1fr; } }
+
+/* ── Dry Run Complete summary ── */
+.dryrun-hero { text-align: center; }
+.dryrun-check { font-size: 46px; color: var(--brand); line-height: 1; }
+.dryrun-hero h2 { color: var(--brand); margin-top: 8px; font-size: 22px; }
+.kpis.kpis-5 { grid-template-columns: repeat(5, 1fr); margin-top: 18px; margin-bottom: 0; }
+@media (max-width: 860px){ .kpis.kpis-5 { grid-template-columns: repeat(2, 1fr); } }
+.preflight { border-left: 4px solid var(--green); background: var(--greenBg); }
+.preflight.warn { border-left-color: var(--amber); background: var(--amberBg); }
+.preflight-head { display: flex; justify-content: space-between; align-items: center; font-size: 13px; color: var(--muted); gap: 12px; flex-wrap: wrap; }
+.preflight-head b { color: var(--ink); }

@@ -50,6 +50,7 @@ export const api = {
   completeConnect: (id, side, body) => post(`/api/projects/${id}/connections/${side}/complete`, body),
   reconnect: (id, side, body) => post(`/api/projects/${id}/connections/${side}/reconnect`, body),
   run: (id, dryRun) => post(`/api/projects/${id}/run`, { dryRun }),
+  scan: (id) => get(`/api/projects/${id}/scan`),
   matrix: (id) => get(`/api/projects/${id}/matrix`),
   report: (id) => get(`/api/projects/${id}/report`),
   conflicts: (id) => get(`/api/projects/${id}/conflicts`),
