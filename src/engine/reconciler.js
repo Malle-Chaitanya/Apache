@@ -10,6 +10,10 @@ export async function reconcile(ctx) {
   let totals = { source: 0, migrated: 0, validated: 0, manual: 0, failed: 0 };
 
   for (const type of LOAD_ORDER) {
+    // A deselected object is not part of this migration — exclude it from the
+    // report entirely (even if leftover rows from an earlier run are staged), so
+    // the counts reflect exactly what the customer chose to migrate.
+    if (ctx.selection?.[type] === false) continue;
     const q = { projectId: project._id };
     const source = await repo(type).count(q);
     if (!source) continue;

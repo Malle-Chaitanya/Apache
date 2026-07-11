@@ -145,7 +145,7 @@ export function Progress({ report, matrix, mode }) {
   return (
     <div className="card">
       <h2>{mode === 'dry' ? 'Dry Run in Progress' : 'Migration in Progress'}</h2>
-      <p className="hint">Watch the activity log below for live updates. {mode === 'dry' ? 'No data is written during a dry run.' : 'Configuration loads first, then data.'}</p>
+      <p className="hint">{mode === 'dry' ? 'No data is written during a dry run.' : 'Configuration loads first, then data.'}</p>
       <div className="progress-hero">
         <Ring pct={pct} label="Progress" />
         <div className="progress-cells">
@@ -203,11 +203,6 @@ export function DryRunSummary({ report, matrix, onGoLive, running }) {
       </button>
     </>
   );
-}
-
-export function Log({ events }) {
-  const text = (events || []).map((e) => `[${(e.phase || '').padEnd(11)}] ${e.message}`).join('\n');
-  return <div className="card"><h2>Activity</h2><pre className="log">{text || 'No activity yet.'}</pre></div>;
 }
 
 export function Report({ report, conflicts, projectId }) {

@@ -7,6 +7,14 @@ import { mapStatus, mapPriority, mapSource, mapFieldType, ROLE_DEFAULT, mapAgent
 
 const asId = (v) => (v == null ? null : Number(v));
 
+// Human-readable source timestamp for provenance. Freshdesk can't backdate
+// individual messages, so we surface the original time inline on each message.
+const origStamp = (iso) => {
+  if (!iso) return '';
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? '' : `${d.toISOString().slice(0, 16).replace('T', ' ')} UTC`;
+};
+
 export const transformers = {
   group: (r) => ({ payload: { name: r.name, description: r.description || '' } }),
 
@@ -75,46 +83,93 @@ export const transformers = {
   kbSection: (r, ctx) => ({ payload: { name: r.name, visibility: 1 }, ctxOut: { categoryId: asId(ctx.resolve('kbCategories', r.category_id)) } }),
 
   kbArticle: (r, ctx) => {
-    const { html, rehosted } = rehostImages(r.body || '');
-    if (rehosted) ctx.addConflict('unmapped_field', `Article "${r.title}" had inline images; URLs rewritten to target host (rehost on load).`, null);
-    return { payload: { title: r.title, description: html, status: r.draft ? 1 : 2 }, ctxOut: { folderId: asId(ctx.resolve('kbSections', r.section_id)) } };
+    const { html, count } = cleanInlineImages(r.body || '');
+    if (count) ctx.addConflict('unmapped_field', `Article "${r.title}" had ${count} Zendesk inline image(s); body shows a marker (article-image rehosting is a separate step).`, null);
+    // Freshdesk requires a non-empty title AND description — guard both so an
+    // empty Zendesk article can't reject the whole create.
+    return {
+      payload: { title: r.title || '(untitled)', description: html || '<p></p>', status: r.draft ? 1 : 2 },
+      ctxOut: { folderId: asId(ctx.resolve('kbSections', r.section_id)) },
+    };
   },
 
   ticket: (r, ctx) => {
-    // Only Freshdesk's built-in ticket types are valid; others (e.g. Zendesk
-    // "task") are omitted rather than rejected.
+    // Value translations prefer the customer's per-project maps (ctx.mapValue),
+    // falling back to the deterministic JS defaults when nothing is overridden —
+    // behavior is identical unless the admin edited a map in the mapping step.
+    // The default `type` map folds Zendesk "task" → Question (no FD equivalent).
     const FD_TYPES = { question: 'Question', incident: 'Incident', problem: 'Problem' };
+    const mv = ctx.mapValue;
     const payload = {
       subject: r.subject || '(no subject)',
-      description: r.description || r.subject || '(migrated from Zendesk)',
-      status: mapStatus(r.status),
-      priority: mapPriority(r.priority),
-      source: mapSource(r.via?.channel),
-      type: FD_TYPES[r.type] || undefined,
+      // Freshdesk's description field renders HTML. Zendesk's first comment holds
+      // the RICH version (`html_body`) — use it so bold/lists/links/headings
+      // survive; `r.description` is the plain/markdown fallback only.
+      description: cleanInlineImages(r.comments?.[0]?.html_body || r.description || r.subject || '(migrated from Zendesk)').html,
+      status: mv ? mv('status', r.status, mapStatus(r.status)) : mapStatus(r.status),
+      priority: mv ? mv('priority', r.priority, mapPriority(r.priority)) : mapPriority(r.priority),
+      source: mv ? mv('source', r.via?.channel, mapSource(r.via?.channel)) : mapSource(r.via?.channel),
+      type: (mv ? mv('type', r.type, FD_TYPES[r.type]) : FD_TYPES[r.type]) || undefined,
       group_id: asId(ctx.resolve('groups', r.group_id)),
       responder_id: asId(ctx.resolve('agents', r.assignee_id)),
       requester_id: asId(ctx.resolve('users', r.requester_id)),
       company_id: asId(ctx.resolve('organizations', r.organization_id)),
       tags: r.tags || [],
+      // Best-effort: some Freshdesk plans/accounts accept original timestamps on
+      // create. The Freshdesk connector attempts these and transparently retries
+      // WITHOUT them if the account rejects them (HTTP 400 invalid_field), so the
+      // ticket still migrates. Per-message original times are surfaced inline
+      // (see child bodies below) since Freshdesk can't backdate replies/notes.
+      created_at: r.created_at,
+      updated_at: r.updated_at,
     };
-    // NOTE: Freshdesk's create-ticket API rejects created_at/updated_at as
-    // "invalid_field" (no backdating on the public endpoint) — including them
-    // fails the whole ticket with HTTP 400. The original Zendesk timestamps are
-    // preserved in staging (sourceRaw) for reporting, but the migrated ticket
-    // carries the migration date.
-    // Custom-field VALUES are deferred (v2): Zendesk cf ids need mapping to the
-    // created Freshdesk field names first, else the ticket create is rejected.
+    // CC / collaborators → Freshdesk `cc_emails` (resolved to emails at extraction).
+    if (r.collaborator_emails?.length) payload.cc_emails = r.collaborator_emails;
+    // Custom-field VALUES: map each Zendesk value onto the migrated Freshdesk
+    // field by NAME (the loader records the name for SAFE-typed custom fields:
+    // text/number/checkbox/date). Dropdown value-translation and Zendesk system
+    // fields are intentionally excluded — resolve returns no name for them, so
+    // they're skipped rather than risking a rejected ticket.
+    const cfv = {};
+    for (const c of (r.custom_fields || [])) {
+      if (c.value == null) continue;
+      const name = ctx.resolve('ticketFieldName', c.id);
+      if (!name) continue;
+      // Coerce the value to what Freshdesk's field type expects. Zendesk sends
+      // everything as-is (e.g. a number as a string), and Freshdesk rejects the
+      // WHOLE ticket on a datatype/length mismatch — so we fit the value here.
+      const coerced = coerceCustomValue(c.value, ctx.resolve('ticketFieldType', c.id), name, ctx);
+      if (coerced !== undefined) cfv[name] = coerced;
+    }
+    if (Object.keys(cfv).length) payload.custom_fields = { ...(payload.custom_fields || {}), ...cfv };
     if (!payload.requester_id) ctx.addConflict('unmapped_field', `Ticket "${(r.subject || '').slice(0, 40)}" requester not among migrated contacts — Freshdesk needs a requester.`, 'Migrate the requester (end-user), or set a default requester.');
-    const children = (r.comments || []).map((c) => {
+    const comments = r.comments || [];
+    // Zendesk's FIRST comment IS the ticket description. Re-importing it as a
+    // reply produces a DUPLICATE opening message (a real migration bug), so skip
+    // it — UNLESS it carries attachments, which would otherwise be lost, in which
+    // case keep it (a minor text repeat beats dropping files).
+    const conv = comments.filter((c, i) => i > 0 || (c.attachments && c.attachments.length));
+    const children = conv.map((c) => {
       const author = asId(ctx.resolve('users', c.author_id)) || asId(ctx.resolve('agents', c.author_id));
       // Freshdesk splits conversations into two endpoints with DIFFERENT payloads:
       //   public comment  → POST /reply  (accepts body + user_id; rejects `private`)
       //   private comment → POST /notes  (accepts body + user_id + private:true)
       // Sending `private` to /reply fails with HTTP 400 invalid_field, so only
       // notes carry it.
+      // CLEAN (default): no per-message prefix — the destination reads native,
+      // and the original timeline lives in the migration report. FORENSIC (opt-in
+      // via project.options.provenanceMode) prefixes each message with its source
+      // time for regulated/audit migrations. Freshdesk bodies are HTML, so the
+      // stamp is wrapped in a tag rather than a literal newline.
+      const stamp = ctx.forensic ? origStamp(c.created_at) : '';
+      const cleaned = cleanInlineImages(c.html_body || c.body || '').html;
+      let body = (stamp ? `<div>[Originally sent ${stamp}]</div>` : '') + cleaned;
+      // Freshdesk rejects an empty reply/note body (HTTP 400) — placeholder when
+      // the message is attachment-only or a system comment with no text.
+      if (!body.replace(/<[^>]*>/g, '').trim()) body += '(no message text)';
       const payload = c.public
-        ? { body: c.body, user_id: author }
-        : { body: c.body, private: true, user_id: author };
+        ? { body, user_id: author }
+        : { body, private: true, user_id: author };
       return {
         targetType: c.public ? 'ticketReply' : 'ticketNote',
         sourceId: String(c.id),
@@ -122,7 +177,21 @@ export const transformers = {
         attachments: (c.attachments || []).map((a) => ({ url: a.content_url, filename: a.file_name, contentType: a.content_type, size: a.size })),
       };
     });
-    return { payload, children };
+    // Migration provenance lives entirely in searchable CUSTOM FIELDS (no in-thread
+    // note — keeps the conversation clean). The connector resolves the account-
+    // specific field names live and writes these at load time.
+    return {
+      payload,
+      children,
+      // Native destination + minimal searchable provenance (matches Help Desk
+      // Migration's approach): only Original Ticket ID + Source Platform go on the
+      // ticket. Full created/updated/timeline history lives in the migration
+      // report (persisted in staging `sourceRaw`), not on the ticket.
+      ctxOut: { migrationMeta: {
+        originalId: String(r.id),
+        sourcePlatform: 'Zendesk',
+      } },
+    };
   },
 };
 
@@ -157,10 +226,50 @@ function resolveRefValue(field, value, ctx) {
   return value;
 }
 
-function rehostImages(html) {
-  let rehosted = false;
-  const out = html.replace(/src="https?:\/\/[^"]*zendesk[^"]*"/g, () => { rehosted = true; return 'src="{{TARGET_REHOSTED_IMAGE}}"'; });
-  return { html: out, rehosted };
+// Fit a Zendesk custom-field value to what its Freshdesk field type accepts.
+// Freshdesk rejects the ENTIRE ticket on a datatype/length mismatch, so we coerce
+// here (and flag lossy adjustments as conflicts). Returns `undefined` to skip a
+// value that can't be safely coerced. `ftype` is the Zendesk source field type.
+function coerceCustomValue(value, ftype, name, ctx) {
+  switch (ftype) {
+    case 'integer': {
+      const n = Number(value);
+      if (!Number.isFinite(n)) { ctx.addConflict('value_out_of_range', `Custom field "${name}": "${value}" is not a number — value skipped so the ticket still migrates.`, 'Set the value manually on the target if needed.'); return undefined; }
+      return Math.trunc(n);
+    }
+    case 'decimal': {
+      const n = Number(value);
+      if (!Number.isFinite(n)) { ctx.addConflict('value_out_of_range', `Custom field "${name}": "${value}" is not a number — value skipped.`, null); return undefined; }
+      return n;
+    }
+    case 'checkbox':
+      return value === true || value === 'true' || value === 1 || value === '1';
+    case 'text': {
+      // Freshdesk single-line custom_text caps at 255 chars; longer values are
+      // truncated (rather than sinking the ticket) with a conflict for the report.
+      const s = String(value);
+      if (s.length > 255) { ctx.addConflict('value_out_of_range', `Custom field "${name}": value was ${s.length} chars; Freshdesk text fields cap at 255, so it was truncated.`, 'Recreate this as a multi-line (paragraph) field on the target if full text is required.'); return s.slice(0, 255); }
+      return s;
+    }
+    case 'textarea':
+      return String(value); // Freshdesk custom_paragraph — no single-line cap.
+    case 'date':
+      return value;          // ISO date string, accepted as-is.
+    default:
+      return value;
+  }
+}
+
+// Zendesk-hosted inline images can't be linked from the destination — their URLs
+// require Zendesk auth and die with the source. The image FILE is migrated
+// automatically as a message attachment (Zendesk includes inline images in the
+// comment's `attachments`, which loadChild downloads → re-uploads — no manual
+// step). So we just replace the broken <img> in the body with a marker. External
+// (non-Zendesk) images are left intact.
+function cleanInlineImages(html) {
+  let count = 0;
+  const out = String(html || '').replace(/<img\b[^>]*\bsrc="[^"]*zendesk[^"]*"[^>]*>/gi, () => { count += 1; return '<em>[inline image — see attachment]</em>'; });
+  return { html: out, count };
 }
 
 const capitalize = (s) => s.charAt(0).toUpperCase() + s.slice(1);

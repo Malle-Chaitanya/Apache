@@ -2,14 +2,16 @@ import React, { useEffect, useRef, useState } from 'react';
 import { api, auth } from './api.js';
 import Login from './Login.jsx';
 import Logo from './Logo.jsx';
-import { Stepper, ReauthBanner, Configure, Kpis, MatrixTable, Log, Report, Progress, DryRunSummary } from './steps.jsx';
+import { Stepper, ReauthBanner, Configure, Kpis, MatrixTable, Report, Progress, DryRunSummary } from './steps.jsx';
 import { ConnectPlatforms, PairPicker } from './Clouds.jsx';
+import { Mapping } from './Mapping.jsx';
 
 // The migration steps, in the order a real migration runs.
 const STEPS = [
   { key: 'connect', label: 'Connect Platforms' },
   { key: 'pair', label: 'Choose Pair' },
   { key: 'select', label: 'Select Data' },
+  { key: 'mapping', label: 'Select & Map' },
   { key: 'precheck', label: 'Dry Run' },
   { key: 'migrate', label: 'Live Migration' },
   { key: 'report', label: 'Report' },
@@ -31,7 +33,6 @@ export default function App() {
   const [matrix, setMatrix] = useState([]);
   const [report, setReport] = useState(null);
   const [conflicts, setConflicts] = useState([]);
-  const [events, setEvents] = useState([]);
   const [running, setRunning] = useState(false);
   const [dryDone, setDryDone] = useState(false);
   const [liveDone, setLiveDone] = useState(false);
@@ -95,8 +96,8 @@ export default function App() {
 
   async function refreshRun() {
     const id = project._id;
-    const [p, m, r, c, e] = await Promise.all([api.getProject(id), api.matrix(id), api.report(id), api.conflicts(id), api.events(id)]);
-    setProject(p); setMatrix(m); setReport(r); setConflicts(c); setEvents(e);
+    const [p, m, r, c] = await Promise.all([api.getProject(id), api.matrix(id), api.report(id), api.conflicts(id)]);
+    setProject(p); setMatrix(m); setReport(r); setConflicts(c);
     const terminal = ['completed', 'failed', 'reauth_required'].includes(p.status);
     // Once we've seen the run actually running, a terminal status means done.
     // Until then, ignore a terminal status left over from a PREVIOUS run — this
@@ -111,6 +112,10 @@ export default function App() {
   function startRun(dryRun) {
     setRunning(true); runModeRef.current = dryRun ? 'dry' : 'live'; armedRef.current = false;
     if (dryRun) setDryDone(false); else setLiveDone(false);
+    // Clear any prior run's report/matrix so the progress ring starts at 0 and
+    // climbs — otherwise the just-finished dry run's counts read as 100% until
+    // the backend re-extracts and resets record statuses.
+    setReport(null); setMatrix([]); setConflicts([]);
     api.run(project._id, dryRun).catch(() => {});
     clearInterval(poll.current);
     poll.current = setInterval(refreshRun, 1000);
@@ -120,7 +125,7 @@ export default function App() {
     clearInterval(poll.current); setRunning(false);
     runModeRef.current = null; armedRef.current = false;
     setDryDone(false); setLiveDone(false);
-    setMatrix([]); setReport(null); setConflicts([]); setEvents([]); setScan(null);
+    setMatrix([]); setReport(null); setConflicts([]); setScan(null);
   }
   function resetToStart() {
     clearRunState(); setProject(null); setPair({ sourceAccountId: '', targetAccountId: '' }); setStep(0);
@@ -176,7 +181,10 @@ export default function App() {
     }
     if (key === 'select') {
       const ok = options.migrateConfig || options.migrateData;
-      return <button className="btn primary" disabled={!ok} onClick={() => setStep(idx('precheck'))}>{ok ? 'Continue to dry run →' : 'Select at least one scope'}</button>;
+      return <button className="btn primary" disabled={!ok} onClick={() => setStep(idx('mapping'))}>{ok ? 'Continue to mapping →' : 'Select at least one scope'}</button>;
+    }
+    if (key === 'mapping') {
+      return <button className="btn primary" onClick={() => setStep(idx('precheck'))}>Continue to dry run →</button>;
     }
     if (key === 'migrate' && liveDone) {
       return <button className="btn primary" onClick={() => setStep(idx('report'))}>View report →</button>;
@@ -197,10 +205,12 @@ export default function App() {
 
         {key === 'select' && <Configure options={options} setOptions={setOptions} scan={scan} scanning={scanning} />}
 
+        {key === 'mapping' && <Mapping projectId={project?._id} />}
+
         {key === 'precheck' && (running ? (
-          <><Progress report={report} matrix={matrix} mode="dry" /><Log events={events} /></>
+          <Progress report={report} matrix={matrix} mode="dry" />
         ) : dryDone ? (
-          <><DryRunSummary report={report} matrix={matrix} running={running} onGoLive={() => { setStep(idx('migrate')); startRun(false); }} /><Log events={events} /></>
+          <DryRunSummary report={report} matrix={matrix} running={running} onGoLive={() => { setStep(idx('migrate')); startRun(false); }} />
         ) : (
           <div className="card">
             <h2>Dry Run (Pre-check)</h2>
@@ -210,9 +220,9 @@ export default function App() {
         ))}
 
         {key === 'migrate' && (running ? (
-          <><Progress report={report} matrix={matrix} mode="live" /><Log events={events} /></>
+          <Progress report={report} matrix={matrix} mode="live" />
         ) : liveDone ? (
-          <><Kpis totals={report?.totals} />{!!matrix.length && <MatrixTable rows={matrix} />}<Log events={events} /></>
+          <><Kpis totals={report?.totals} />{!!matrix.length && <MatrixTable rows={matrix} />}</>
         ) : (
           <div className="card">
             <h2>Live Migration</h2>

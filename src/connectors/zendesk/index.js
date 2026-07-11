@@ -5,7 +5,7 @@ import { HttpClient } from '../../lib/httpClient.js';
 const MAP = {
   groups: { path: '/groups.json', key: 'groups' },
   roles: { path: '/custom_roles.json', key: 'custom_roles' },
-  agents: { path: '/users.json', key: 'users', query: { 'role[]': 'agent' } },
+  agents: { path: '/users.json', key: 'users', query: { 'role[]': ['agent', 'admin'] } }, // admins are Freshdesk agents too
   organizations: { path: '/organizations.json', key: 'organizations' },
   users: { path: '/users.json', key: 'users', query: { role: 'end-user' } },
   ticketFields: { path: '/ticket_fields.json', key: 'ticket_fields' },
@@ -59,7 +59,42 @@ export class ZendeskSource {
       path = data.next_page ? data.next_page.replace(this.baseUrl, '') : null;
       query = undefined;
     }
+    // Zendesk keeps group membership OUT of the user object — join it in so
+    // agents migrate WITH their groups (Freshdesk needs the agent in the ticket's
+    // group to accept an assignment).
+    if (type === 'agents') await this._attachGroupMemberships(out);
+    // CC/collaborators are user ids on the ticket; Freshdesk wants emails → resolve.
+    if (type === 'tickets') await this._attachCollaboratorEmails(out);
     return out;
+  }
+
+  async _attachGroupMemberships(agents) {
+    const byUser = new Map();
+    let path = '/group_memberships.json';
+    let query = { per_page: 100 };
+    while (path) {
+      const { data } = await this.http.get(path, { query });
+      for (const gm of data.group_memberships || []) {
+        if (!byUser.has(gm.user_id)) byUser.set(gm.user_id, []);
+        byUser.get(gm.user_id).push(gm.group_id);
+      }
+      path = data.next_page ? data.next_page.replace(this.baseUrl, '') : null;
+      query = undefined;
+    }
+    for (const a of agents) if (!a.group_ids?.length) a.group_ids = byUser.get(a.id) || [];
+  }
+
+  async _attachCollaboratorEmails(tickets) {
+    const ids = [...new Set(tickets.flatMap((t) => t.collaborator_ids || []))];
+    if (!ids.length) return;
+    const emailById = new Map();
+    for (let i = 0; i < ids.length; i += 100) {
+      try {
+        const { data } = await this.http.get('/users/show_many.json', { query: { ids: ids.slice(i, i + 100).join(',') } });
+        for (const u of data.users || []) if (u.email) emailById.set(u.id, u.email);
+      } catch { /* best-effort */ }
+    }
+    for (const t of tickets) t.collaborator_emails = (t.collaborator_ids || []).map((id) => emailById.get(id)).filter(Boolean);
   }
 
   async listComments(ticket) {

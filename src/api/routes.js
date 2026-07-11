@@ -6,6 +6,7 @@ import { MATRIX, LOAD_ORDER } from '../mapping/matrix.js';
 import { connectionManager } from '../auth/connectionManager.js';
 import { requireAuth, login as portalLogin } from '../auth/appAuth.js';
 import { sourcePlatforms, targetPlatforms, makeSource } from '../connectors/registry.js';
+import { objectOverview, getSelection, saveSelection, getValueMap, saveValueMap, resetValueMap, getFieldMap, saveFieldMap } from '../mapping/mappingService.js';
 import { log } from '../lib/logger.js';
 
 export function apiRouter() {
@@ -131,7 +132,11 @@ export function apiRouter() {
   });
   r.get('/projects/:id/matrix', async (req, res) => {
     const id = req.params.id; const rows = [];
+    // Reflect the mapping-step selection so the progress table only shows objects
+    // that are actually part of this migration (matches the dry-run/report counts).
+    const sel = await getSelection(id);
     for (const type of LOAD_ORDER) {
+      if (sel[type] === false) continue;
       const m = MATRIX[type];
       rows.push({ type, domain: m.domain, targetType: m.targetType, feasibility: m.feasibility,
         source: await repo(type).count({ projectId: id }), migrated: await repo(type).count({ projectId: id, status: 'loaded' }),
@@ -161,6 +166,39 @@ export function apiRouter() {
       res.json({ rows, totals: { config, data, all: config + data } });
     } catch (e) { next(e); }
   });
+  // ── Mapping layer (Select Objects / Field & Value Mapping) ──
+  // Object overview drives the "Select Objects" screen: every source object,
+  // its target, feasibility, selection state, and which mapping affordances it
+  // exposes (editable value maps / agent matching / filters).
+  r.get('/projects/:id/mapping/overview', async (req, res, next) => {
+    try { res.json(await objectOverview(req.params.id)); } catch (e) { next(e); }
+  });
+  r.get('/projects/:id/mapping/selection', async (req, res, next) => {
+    try { res.json(await getSelection(req.params.id)); } catch (e) { next(e); }
+  });
+  r.put('/projects/:id/mapping/selection', async (req, res, next) => {
+    try { res.json(await saveSelection(req.params.id, req.body?.selection || req.body || {})); } catch (e) { next(e); }
+  });
+  // Field mapping (Tier 1) for a data object: the source→target field list with
+  // per-field skip state. Enum fields carry a `valueMap` name → their Tier-2 map.
+  r.get('/projects/:id/mapping/field/:type', async (req, res, next) => {
+    try { res.json(await getFieldMap(req.params.id, req.params.type)); } catch (e) { next(e); }
+  });
+  r.put('/projects/:id/mapping/field/:type', async (req, res, next) => {
+    try { res.json(await saveFieldMap(req.params.id, req.params.type, { skip: req.body?.skip || [] })); } catch (e) { next(e); }
+  });
+  // One editable value map (status | priority | source | type). GET returns the
+  // rows (source value → target) + target option set + "use for empty" default.
+  r.get('/projects/:id/mapping/value/:name', async (req, res, next) => {
+    try { res.json(await getValueMap(req.params.id, req.params.name)); } catch (e) { next(e); }
+  });
+  r.put('/projects/:id/mapping/value/:name', async (req, res, next) => {
+    try { res.json(await saveValueMap(req.params.id, req.params.name, req.body?.map || req.body || {})); } catch (e) { next(e); }
+  });
+  r.post('/projects/:id/mapping/value/:name/reset', async (req, res, next) => {
+    try { res.json(await resetValueMap(req.params.id, req.params.name)); } catch (e) { next(e); }
+  });
+
   r.get('/projects/:id/report', async (req, res) => { const rep = await repo('reports').findOne({ projectId: req.params.id }); res.json(rep?.summary || null); });
   r.get('/projects/:id/conflicts', async (req, res) => res.json(await repo('conflicts').find({ projectId: req.params.id })));
   r.get('/projects/:id/events', async (req, res) => { const e = await repo('events').find({ projectId: req.params.id }); res.json(e.slice(-Number(req.query.n || 500))); });

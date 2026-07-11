@@ -29,6 +29,11 @@ export async function loadType(ctx, type) {
       emit('transform', type, `transform failed for ${type}#${ent.sourceId}: ${err.message}`, 'error');
       continue;
     }
+    // Honor the admin's field mapping: drop any field they chose to skip. Required
+    // fields are never in this set (the mapping API refuses to skip them), so the
+    // record still validates on the target.
+    const skips = ctx.fieldSkips?.[type];
+    if (skips?.size && result?.payload) for (const k of skips) delete result.payload[k];
     await repo(type).updateOne({ _id: ent._id }, { transformed: result.payload });
 
     // Objects with no create API → recorded as manual (conflict already written by transformer).
@@ -41,8 +46,19 @@ export async function loadType(ctx, type) {
       const ctxOut = result.ctxOut || {};
       // Macro replies become canned responses, which must live in a folder.
       if (meta.targetType === 'cannedResponses' && target.ensureCannedFolder) ctxOut.folderId = await target.ensureCannedFolder();
-      const { id } = await target.create(meta.targetType, result.payload, ctxOut);
+      const { id, raw } = await target.create(meta.targetType, result.payload, ctxOut);
       await writeIdmap(ctx, type, ent.sourceId, id, meta.targetType);
+      // Remember the Freshdesk field NAME for SAFE-typed custom fields so tickets
+      // can carry their values (dropdowns/system fields excluded — no clean 1:1).
+      if (type === 'ticketFields' && raw?.name) {
+        const SAFE = new Set(['text', 'textarea', 'integer', 'decimal', 'checkbox', 'date']);
+        if (SAFE.has(ent.sourceRaw?.type)) {
+          ctx.idCache.set(`ticketFieldName:${ent.sourceId}`, raw.name);
+          // Remember the source TYPE too, so the ticket transformer can coerce the
+          // value (integer/decimal → number, text → ≤255) instead of sending raw.
+          ctx.idCache.set(`ticketFieldType:${ent.sourceId}`, ent.sourceRaw.type);
+        }
+      }
       await repo(type).updateOne({ _id: ent._id }, { status: 'loaded', targetId: String(id) });
       ctx.stats.migrated++;
 
@@ -60,6 +76,19 @@ export async function loadType(ctx, type) {
         const existingId = extractExistingId(err.body) ?? await lookupExisting(target, meta.targetType, result.payload);
         if (existingId) {
           await writeIdmap(ctx, type, ent.sourceId, existingId, meta.targetType, true);
+          // A reused record keeps its existing profile — but some fields (e.g. an
+          // agent's group membership) must be (re)applied so downstream references
+          // work (ticket assignment). Best-effort: never fail the reuse.
+          if (target.afterReuse) { try { await target.afterReuse(meta.targetType, existingId, result.payload, result.ctxOut || {}); } catch { /* best-effort */ } }
+          // Record the FD field name for safe custom fields (same as the create path).
+          if (type === 'ticketFields') {
+            const SAFE = new Set(['text', 'textarea', 'integer', 'decimal', 'checkbox', 'date']);
+            const nm = err.body?.errors?.[0]?.additional_info?.name;
+            if (nm && SAFE.has(ent.sourceRaw?.type)) {
+              ctx.idCache.set(`ticketFieldName:${ent.sourceId}`, nm);
+              ctx.idCache.set(`ticketFieldType:${ent.sourceId}`, ent.sourceRaw.type);
+            }
+          }
           await repo(type).updateOne({ _id: ent._id }, { status: 'loaded', targetId: String(existingId) });
           ctx.stats.migrated++;
           emit('load', type, `${type}#${ent.sourceId} already existed → reused #${existingId}`);
@@ -118,8 +147,21 @@ async function loadChild(ctx, type, ticketId, child) {
 function buildCtx(ctx, type) {
   return {
     sourceKey: type,
+    forensic: !!ctx.forensic, // provenance mode → transformers gate visible prefixes on this
     resolve: (t, sourceId) => (sourceId == null ? null : ctx.idCache.get(`${t}:${String(sourceId)}`) ?? null),
     addConflict: (kind, detail, suggestion) => ctx.conflicts.push({ projectId: ctx.project._id, entityType: type, kind, detail, suggestion, status: kind === 'no_api' ? 'manual' : 'open' }),
+    // Effective value map lookup (customer override ⊕ JS default). Returns the
+    // mapped target for `sourceValue`; falls back to the map's "use for empty"
+    // default, then the caller's `fallback`. A map that resolves to null means
+    // "skip" (the transformer omits the field).
+    mapValue: (name, sourceValue, fallback) => {
+      const m = ctx.valueMaps?.[name];
+      if (!m) return fallback;
+      const key = sourceValue == null ? '__default' : sourceValue;
+      const v = m[key];
+      if (v !== undefined) return v;
+      return m.__default ?? fallback;
+    },
   };
 }
 

@@ -5,10 +5,19 @@ import { contentHash } from '../lib/hash.js';
 // EXTRACT: pull every object from the source into staging (one collection per
 // type). Idempotent: re-extracting the same object updates in place.
 export async function extract(ctx) {
-  const { project, source, emit } = ctx;
+  const { project, source, emit, selection } = ctx;
   const counts = {};
   for (const type of EXTRACT_ORDER) {
     const meta = MATRIX[type];
+    // Honor the mapping-step selection at EXTRACT time (not just LOAD), so a
+    // deselected object stages nothing → shows 0 "picked up" and never inflates
+    // the dry-run / report counts. The source SCAN step still shows full source
+    // totals, so "what exists" vs "what we'll migrate" stay clearly separate.
+    if (selection?.[type] === false) {
+      counts[type] = 0;
+      emit('extract', type, `${type}: skipped (deselected in mapping)`);
+      continue;
+    }
     const rows = await source.list(type);
     for (const raw of rows) {
       // Ticket conversations are a sub-resource; pull them into the staged doc.

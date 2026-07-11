@@ -16,6 +16,7 @@ async function handle(r) {
 }
 const get = (url) => fetch(url, { headers: hdr(false) }).then(handle);
 const post = (url, body) => fetch(url, { method: 'POST', headers: hdr(true), body: JSON.stringify(body || {}) }).then(handle);
+const put = (url, body) => fetch(url, { method: 'PUT', headers: hdr(true), body: JSON.stringify(body || {}) }).then(handle);
 const del = (url) => fetch(url, { method: 'DELETE', headers: hdr(false) }).then(handle);
 
 export const auth = {
@@ -52,6 +53,17 @@ export const api = {
   run: (id, dryRun) => post(`/api/projects/${id}/run`, { dryRun }),
   scan: (id) => get(`/api/projects/${id}/scan`),
   matrix: (id) => get(`/api/projects/${id}/matrix`),
+
+  // Mapping layer (Select Objects · Field & Value Mapping)
+  mappingOverview: (id) => get(`/api/projects/${id}/mapping/overview`),
+  getSelection: (id) => get(`/api/projects/${id}/mapping/selection`),
+  saveSelection: (id, selection) => put(`/api/projects/${id}/mapping/selection`, { selection }),
+  getFieldMap: (id, type) => get(`/api/projects/${id}/mapping/field/${type}`),
+  saveFieldMap: (id, type, skip) => put(`/api/projects/${id}/mapping/field/${type}`, { skip }),
+  getValueMap: (id, name) => get(`/api/projects/${id}/mapping/value/${name}`),
+  saveValueMap: (id, name, map) => put(`/api/projects/${id}/mapping/value/${name}`, { map }),
+  resetValueMap: (id, name) => post(`/api/projects/${id}/mapping/value/${name}/reset`),
+
   report: (id) => get(`/api/projects/${id}/report`),
   conflicts: (id) => get(`/api/projects/${id}/conflicts`),
   events: (id, n = 500) => get(`/api/projects/${id}/events?n=${n}`),

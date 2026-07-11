@@ -14,7 +14,15 @@ export class HttpClient {
   async request(method, path, { query, body, multipart } = {}) {
     let url = path.startsWith('http') ? path : `${this.baseUrl}${path}`;
     if (query) {
-      const qs = new URLSearchParams(query).toString();
+      // Support array values as REPEATED params (e.g. role[]=agent&role[]=admin);
+      // a plain URLSearchParams would comma-join them, which Zendesk rejects.
+      const usp = new URLSearchParams();
+      for (const [k, v] of Object.entries(query)) {
+        if (v === undefined || v === null) continue;
+        if (Array.isArray(v)) v.forEach((item) => usp.append(k, item));
+        else usp.append(k, v);
+      }
+      const qs = usp.toString();
       if (qs) url += `?${qs}`;
     }
     for (let attempt = 0; attempt <= this.maxRetries; attempt++) {

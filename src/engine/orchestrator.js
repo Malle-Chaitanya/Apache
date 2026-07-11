@@ -2,6 +2,7 @@ import { repo } from '../db/repository.js';
 import { makeSource, makeTarget } from '../connectors/registry.js';
 import { connectionManager } from '../auth/connectionManager.js';
 import { LOAD_ORDER, MATRIX } from '../mapping/matrix.js';
+import { effectiveValueMaps, effectiveFieldSkips, getSelection } from '../mapping/mappingService.js';
 import { extract } from './extractor.js';
 import { loadType } from './loader.js';
 import { reconcile } from './reconciler.js';
@@ -28,8 +29,19 @@ export async function runMigration(projectId, { dryRun = false } = {}) {
     throw err;
   }
 
+  // Effective mapping (JS defaults ⊕ the customer's per-project overrides), loaded
+  // once so every transform in this run sees the same maps. Empty overrides ⇒
+  // identical to the hard-coded defaults (no regression).
+  const valueMaps = await effectiveValueMaps(projectId);
+  const selection = await getSelection(projectId);
+  const fieldSkips = await effectiveFieldSkips(projectId);
+
   const ctx = {
-    project, dryRun,
+    project, dryRun, valueMaps, selection, fieldSkips,
+    // Provenance mode: 'clean' (default) = native-looking destination, source
+    // metadata only in searchable custom fields + the migration report.
+    // 'forensic' (opt-in) additionally prefixes each message with its source time.
+    forensic: project.options?.provenanceMode === 'forensic',
     source: makeSource(project.source.platform, src.connectorCreds),
     target: makeTarget(project.target.platform, tgt.connectorCreds),
     idCache: new Map(),
@@ -54,8 +66,28 @@ export async function runMigration(projectId, { dryRun = false } = {}) {
     await setPhase(project, 'extract');
     await extract(ctx);
 
+    // PRE-FLIGHT (live runs only). Freshdesk exposes NO reliable per-request
+    // notification suppression, so migrating public replies would email real
+    // requesters about years-old tickets. Industry practice (Help Desk Migration)
+    // is to disable notifications/automations at the ACCOUNT level for the
+    // migration window — there's no API to toggle them, so we surface it as a
+    // blocking checklist item and record it as an open conflict for the report.
+    if (!dryRun && !project.options?.notificationsDisabledAck) {
+      ctx.emit('load', null, 'PRE-FLIGHT: disable Freshdesk Email Notifications + Automations before a live migration, or migrated replies will email requesters. Re-enable after.', 'warn');
+      ctx.conflicts.push({
+        projectId, entityType: 'tickets', kind: 'manual_step',
+        detail: 'Outbound notifications not confirmed disabled. Freshdesk has no per-request suppression; migrating public replies emails requesters otherwise.',
+        suggestion: 'Freshdesk Admin → Workflows → Email Notifications: turn OFF Agent, Requester and CC notifications; also disable Automations & Scenario Automations. Re-enable everything after the migration completes. (Set project.options.notificationsDisabledAck=true to acknowledge.)',
+        status: 'open',
+      });
+    }
+
     // LOAD — config first, then data. Emit phase transitions for the dashboard.
+    // Skip objects the customer deselected in the mapping step (dependencies they
+    // still need are pulled by whatever references them; selection only gates the
+    // top-level load of that object type).
     for (const type of LOAD_ORDER) {
+      if (ctx.selection[type] === false) { ctx.emit('load', type, `${type}: skipped (deselected in mapping)`); continue; }
       await setPhase(project, MATRIX[type].domain === 'config' ? 'load_config' : 'load_data');
       await loadType(ctx, type);
     }
