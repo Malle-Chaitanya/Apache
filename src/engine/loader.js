@@ -1,9 +1,29 @@
 import { repo } from '../db/repository.js';
+import { config } from '../config.js';
 import { MATRIX, LOAD_ORDER } from '../mapping/matrix.js';
 import { transformers } from '../mapping/transformers/index.js';
 import { NoApiError } from '../connectors/freshdesk/index.js';
 
+// Bounded-concurrency worker pool: run `fn` over `items` with at most `n` in
+// flight. Workers pull the next index as they free up (queue semantics), so the
+// pipe stays full up to the shared rate limiter. A thrown fn rejects the pool.
+async function runPool(items, n, fn) {
+  const width = Math.max(1, Math.min(n || 1, items.length));
+  let idx = 0;
+  const worker = async () => { while (idx < items.length) { const i = idx++; await fn(items[i]); } };
+  await Promise.all(Array.from({ length: width }, worker));
+}
+
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024; // Freshdesk's per-file attachment cap
+
+// Split a work-set into fixed-size chunks (the batch unit). Order is preserved,
+// so `seq` is a stable index into the original list for a given job.
+function chunk(items, size) {
+  const n = Math.max(1, size | 0);
+  const out = [];
+  for (let i = 0; i < items.length; i += n) out.push(items.slice(i, i + n));
+  return out;
+}
 
 // TRANSFORM + LOAD, in dependency order (config before data). FK references are
 // resolved through the in-memory idmap cache, which is filled as objects load —
@@ -17,9 +37,12 @@ export async function loadType(ctx, type) {
   const meta = MATRIX[type];
   const entities = await repo(type).find({ projectId: project._id, status: { $in: ['extracted', 'transformed', 'validated', 'failed'] } });
 
-  for (const ent of entities) {
+  // Returns a batch-count bucket for this record: 'ok' (written/reused/validated),
+  // 'skipped' (already crosswalked / manual / no-API), or 'failed'. Auth failures
+  // (401/403) still THROW so the pool rejects and the run pauses for reconnect.
+  const processEntity = async (ent) => {
     // Skip if already crosswalked (resumable / idempotent).
-    if (idCache.has(`${type}:${ent.sourceId}`)) { await mark(type, ent, 'loaded'); continue; }
+    if (idCache.has(`${type}:${ent.sourceId}`)) { await mark(type, ent, 'loaded'); return 'skipped'; }
 
     let result;
     try {
@@ -27,7 +50,7 @@ export async function loadType(ctx, type) {
     } catch (err) {
       await mark(type, ent, 'failed', err.message);
       emit('transform', type, `transform failed for ${type}#${ent.sourceId}: ${err.message}`, 'error');
-      continue;
+      return 'failed';
     }
     // Honor the admin's field mapping: drop any field they chose to skip. Required
     // fields are never in this set (the mapping API refuses to skip them), so the
@@ -38,9 +61,9 @@ export async function loadType(ctx, type) {
 
     // Objects with no create API → recorded as manual (conflict already written by transformer).
     const cap = target.capability(meta.targetType);
-    if (result.manual || !cap.creatable) { await mark(type, ent, 'manual'); ctx.stats.manual++; continue; }
+    if (result.manual || !cap.creatable) { await mark(type, ent, 'manual'); ctx.stats.manual++; return 'skipped'; }
 
-    if (dryRun) { await mark(type, ent, 'validated'); continue; }
+    if (dryRun) { await mark(type, ent, 'validated'); return 'ok'; }
 
     try {
       const ctxOut = result.ctxOut || {};
@@ -63,12 +86,14 @@ export async function loadType(ctx, type) {
       ctx.stats.migrated++;
 
       // Sub-resources (ticket replies/notes) load against the new parent id.
+      // Sequential WITHIN a ticket (order matters); different tickets run in parallel.
       for (const child of result.children || []) await loadChild(ctx, type, id, child);
       emit('load', type, `loaded ${type}#${ent.sourceId} → ${id}`);
+      return 'ok';
     } catch (err) {
-      if (err instanceof NoApiError || err.noApi) { await mark(type, ent, 'manual'); ctx.stats.manual++; continue; }
-      // Auth failure = rotated/revoked credential → abort so the orchestrator
-      // can pause and request reconnect (resume later from checkpoint).
+      if (err instanceof NoApiError || err.noApi) { await mark(type, ent, 'manual'); ctx.stats.manual++; return 'skipped'; }
+      // Auth failure = rotated/revoked credential → rethrow so the pool rejects
+      // and the orchestrator can pause and request reconnect (resume later).
       if (err.status === 401 || err.status === 403) throw err;
       // IDEMPOTENCY: already exists on the target (re-run / prior migration) →
       // reuse it, never duplicate. Freshdesk returns the existing id in the 409.
@@ -92,7 +117,7 @@ export async function loadType(ctx, type) {
           await repo(type).updateOne({ _id: ent._id }, { status: 'loaded', targetId: String(existingId) });
           ctx.stats.migrated++;
           emit('load', type, `${type}#${ent.sourceId} already existed → reused #${existingId}`);
-          continue;
+          return 'ok';
         }
       }
       // BEST-EFFORT config (SLA / products / business hours): we attempt the API;
@@ -102,13 +127,52 @@ export async function loadType(ctx, type) {
         const nm = ent.sourceRaw?.title || ent.sourceRaw?.name || ent.sourceId;
         ctx.conflicts.push({ projectId: project._id, entityType: type, sourceId: ent.sourceId, kind: 'no_api', detail: `${type} "${nm}" couldn't be auto-created (${(err.message || '').slice(0, 120)}).`, suggestion: 'Recreate it in the Freshdesk admin UI.', status: 'manual' });
         await mark(type, ent, 'manual'); ctx.stats.manual++;
-        continue;
+        return 'skipped';
       }
+      // PER-ITEM failure isolation: mark this record failed and keep going — it
+      // stays retryable (a re-run re-picks 'failed' records = the retry queue).
       await mark(type, ent, 'failed', err.message);
       ctx.stats.failed++;
       emit('load', type, `load failed for ${type}#${ent.sourceId}: ${err.message}`, 'error');
+      return 'failed';
+    }
+  };
+
+  // Types load sequentially (LOAD_ORDER) so all cross-type FK deps are already
+  // crosswalked. Within a type the work-set is split into fixed-size BATCHES:
+  // each batch is its own checkpointed, retryable unit of work (PRD §8.1 / §12).
+  // A `batches` doc is the operational record — status, attempt count, per-batch
+  // {in/ok/skipped/failed} tallies and timings — so progress is observable and a
+  // paused run shows exactly where it stopped. Records inside a batch stay
+  // independent → up to `config.concurrency` run at once through the worker pool.
+  const batches = chunk(entities, config.batchSize);
+  for (let seq = 0; seq < batches.length; seq++) {
+    const items = batches[seq];
+    const key = { jobId: ctx.jobId, entityType: type, phase: 'load', seq };
+    const prior = await repo('batches').findOne(key);
+    // Resume: a batch already marked done is skipped without re-touching its items
+    // (item-level idmap still guarantees no duplicates if it is ever re-entered).
+    if (prior?.status === 'done') { emit('load', type, `${type} batch ${seq + 1}/${batches.length}: resumed (already done)`); continue; }
+
+    const batch = await repo('batches').upsert(key, {
+      ...key, projectId: project._id, size: items.length,
+      status: 'in_progress', attempts: (prior?.attempts || 0) + 1, startedAt: new Date(),
+    });
+    const counts = { in: items.length, ok: 0, skipped: 0, failed: 0 };
+    try {
+      await runPool(items, config.concurrency, async (ent) => { counts[await processEntity(ent)]++; });
+      await repo('batches').updateOne({ _id: batch._id }, { status: 'done', counts, finishedAt: new Date() });
+      emit('load', type, `${type} batch ${seq + 1}/${batches.length}: ${counts.ok} ok, ${counts.skipped} skipped, ${counts.failed} failed`);
+    } catch (err) {
+      // The pool only rejects on a rethrown auth failure (rotated/revoked
+      // credential). Record the partial batch as failed so the report pinpoints
+      // where the run paused, then propagate so the orchestrator can pause+resume.
+      await repo('batches').updateOne({ _id: batch._id }, { status: 'failed', counts, finishedAt: new Date() });
+      emit('load', type, `${type} batch ${seq + 1}/${batches.length} paused: ${err.message}`, 'error');
+      throw err;
     }
   }
+
   const done = await repo(type).count({ projectId: project._id, status: 'loaded' });
   emit('load', type, `${type}: ${done} loaded`);
 }

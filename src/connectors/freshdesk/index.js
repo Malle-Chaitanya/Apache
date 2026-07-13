@@ -101,30 +101,54 @@ export class FreshdeskTarget {
     // Tickets: attempt original created_at/updated_at (some plans allow it).
     // If THIS account rejects them, strip and retry once, then remember so every
     // subsequent ticket skips the doomed first attempt.
+    // SLA policies: validate applicable_to.ticket_types against the target account's
+    // REAL ticket types — a renamed/removed type would 400 the whole policy. Drop
+    // any that don't exist; if that empties the scope, the bestEffort loader path
+    // turns it into a checklist item rather than crashing the run.
+    if (targetType === 'slaPolicies' && Array.isArray(payload.applicable_to?.ticket_types)) {
+      const valid = await this._ticketTypes();
+      if (valid.length) {
+        const kept = payload.applicable_to.ticket_types.filter((t) => valid.includes(t));
+        const applicable_to = { ...payload.applicable_to, ticket_types: kept };
+        if (!kept.length) delete applicable_to.ticket_types;
+        payload = { ...payload, applicable_to };
+      }
+    }
+
     if (targetType === 'tickets') {
       const post = async (b) => { const { data } = await this.http.post(t.path(ctx), { body: b }); return { id: data.id, raw: data }; };
-      const body = this._ticketTimestampsUnsupported ? stripTimestamps(payload) : payload;
-      try {
-        return await post(body);
-      } catch (err) {
-        if (err.status !== 400) throw err;
-        // Strip ONLY what the account actually rejected and retry once, so the
-        // ticket still migrates: created_at/updated_at (plan-gated) and/or
-        // custom-field VALUES (best-effort — a bad value must never sink a ticket).
-        const tsErr = isTimestampFieldError(err.body);
-        const cfErr = isCustomFieldError(err.body);
-        if (!tsErr && !cfErr) throw err; // unknown 400 → surface it
-        if (tsErr) this._ticketTimestampsUnsupported = true;
-        let retry = tsErr ? stripTimestamps(body) : { ...body };
-        if (cfErr && retry.custom_fields) {
-          // Drop only the rejected custom fields; keep the good values + provenance.
-          const bad = offendingCustomFields(err.body);
-          const cf = { ...retry.custom_fields };
-          if (bad.length) for (const n of bad) delete cf[n]; else Object.keys(cf).forEach((k) => delete cf[k]);
-          retry = Object.keys(cf).length ? { ...retry, custom_fields: cf } : (({ custom_fields, ...rest }) => rest)(retry);
+      // A ticket must NEVER be lost to a mappable-but-missing reference or a bad
+      // value (industry behaviour: migrate it unassigned/ungrouped and flag it).
+      // Freshdesk validates SEQUENTIALLY — it reports one blocking field, and only
+      // once that's fixed does it surface the next — so we LOOP, peeling whatever
+      // it rejects each round until the ticket lands or hits something unfixable:
+      //   • created_at/updated_at (plan-gated timestamps)
+      //   • group_id / responder_id / company_id (assignee/group/company that
+      //     didn't resolve to a live Freshdesk record → drop, land unassigned)
+      //   • custom-field VALUES (best-effort)
+      let body = this._ticketTimestampsUnsupported ? stripTimestamps(payload) : { ...payload };
+      for (let attempt = 0; attempt < 5; attempt++) {
+        try {
+          return await post(body);
+        } catch (err) {
+          if (err.status !== 400) throw err;
+          const tsErr = isTimestampFieldError(err.body);
+          const cfErr = isCustomFieldError(err.body);
+          const badRefs = offendingRefFields(err.body); // group_id / responder_id / company_id
+          if (!tsErr && !cfErr && !badRefs.length) throw err; // nothing we can strip → surface it
+          if (tsErr) { this._ticketTimestampsUnsupported = true; body = stripTimestamps(body); }
+          for (const f of badRefs) delete body[f]; // migrate without the invalid reference
+          if (cfErr && body.custom_fields) {
+            const bad = offendingCustomFields(err.body);
+            const cf = { ...body.custom_fields };
+            if (bad.length) for (const n of bad) delete cf[n]; else Object.keys(cf).forEach((k) => delete cf[k]);
+            if (Object.keys(cf).length) body = { ...body, custom_fields: cf };
+            else body = (({ custom_fields, ...rest }) => rest)(body);
+          }
+          // loop: retry with the reduced body (peels the next sequential error)
         }
-        return await post(retry);
       }
+      return await post(body); // final attempt — throws if still rejected (real, unfixable error)
     }
     try {
       const { data } = ctx.attachments?.length
@@ -132,9 +156,42 @@ export class FreshdeskTarget {
         : await this.http.post(t.path(ctx), { body: payload });
       return { id: data.id, raw: data };
     } catch (err) {
+      // A reply/note whose ORIGINAL author can't post — a deleted/deactivated
+      // agent or an unmigratable contact → Freshdesk 403 "invalid_user"
+      // ("not authorized … on behalf of this user"). Re-post WITHOUT user_id so
+      // the message still migrates, attributed to the migrating (API) agent,
+      // rather than being dropped. (Help Desk Migration behaves the same way.)
+      if ((err.status === 403 || err.status === 400)
+          && (targetType === 'ticketReply' || targetType === 'ticketNote')
+          && payload.user_id
+          && /invalid_user|not authorized|on behalf/i.test(JSON.stringify(err.body || ''))) {
+        const { user_id, ...rest } = payload;
+        const { data } = ctx.attachments?.length
+          ? await this.http.post(t.path(ctx), { multipart: { fields: flattenForm(rest), files: ctx.attachments } })
+          : await this.http.post(t.path(ctx), { body: rest });
+        return { id: data.id, raw: data };
+      }
       // Safety-net: if a KB category/folder name collided despite the check above
       // (pagination lag, concurrent create), re-read fresh and reuse the existing
       // one instead of hard-failing the whole KB chain.
+      // A ticket field whose label/cf_ name already exists (a default field, or one
+      // created concurrently by another worker → stale dedup cache). Re-read live
+      // and reuse it instead of failing the field.
+      // Freshdesk enforces UNIQUE SLA policy names → a re-run whose idmap doesn't
+      // already track this policy 400s with "name already exists". Find it by name
+      // and UPDATE it (PUT) instead of failing — makes re-runs idempotent AND
+      // propagate changes. (There's no create-duplicate risk; Freshdesk blocks it.)
+      if ((err.status === 400 || err.status === 409) && targetType === 'slaPolicies'
+          && /already exists/i.test(JSON.stringify(err.body || ''))) {
+        const all = await this._pageAll('/sla_policies');            // paginate — match may be page 2+
+        const norm = (s) => String(s || '').trim().toLowerCase();     // Freshdesk name-uniqueness is not case-sensitive
+        const match = all.find((p) => norm(p.name) === norm(payload.name));
+        if (match) { const upd = await this.http.put(`/sla_policies/${match.id}`, { body: payload }); return { id: match.id, raw: upd.data || match }; }
+      }
+      if (err.status === 409 && targetType === 'ticketFields') {
+        const existing = await this._existingTicketField(payload.label, true);
+        if (existing) return { id: existing.id, raw: existing };
+      }
       if (err.status === 409 && targetType === 'kbCategories') {
         const c = await this._existingCategory(payload.name, true);
         if (c) return { id: c.id, raw: c };
@@ -198,22 +255,46 @@ export class FreshdeskTarget {
 
   // Find an existing ticket field by label (cached) so we reuse instead of
   // creating duplicates on re-runs.
-  async _existingTicketField(label) {
-    if (!this._tfCache) {
-      try { const { data } = await this.http.get('/admin/ticket_fields'); this._tfCache = Array.isArray(data) ? data : []; }
-      catch { this._tfCache = []; }
+  // Promise-memoized: parallel workers share ONE in-flight fetch (no race that
+  // would let two workers create the same field twice).
+  // The account's real ticket-type names (memoized), for validating an SLA policy's
+  // applicable_to.ticket_types — a renamed/removed type would otherwise 400.
+  async _ticketTypes() {
+    this._ttP ||= (async () => {
+      try {
+        const { data } = await this.http.get('/admin/ticket_fields');
+        const tf = (Array.isArray(data) ? data : []).find((f) => f.name === 'ticket_type');
+        if (!tf) return [];
+        let choices = tf.choices;
+        if (!choices) { try { const { data: full } = await this.http.get(`/admin/ticket_fields/${tf.id}`); choices = full.choices; } catch { choices = null; } }
+        const arr = Array.isArray(choices) ? choices : (choices && typeof choices === 'object' ? Object.keys(choices) : []);
+        return arr.map((c) => (typeof c === 'string' ? c : (c.value ?? c.label ?? c.name))).filter(Boolean);
+      } catch { return []; }
+    })();
+    return this._ttP;
+  }
+
+  async _existingTicketField(label, fresh = false) {
+    // `fresh` re-reads live — used after a 409 to catch a field created concurrently
+    // by another worker (stale cache) or a default field the first read missed.
+    if (fresh || !this._tfCacheP) {
+      this._tfCacheP = this.http.get('/admin/ticket_fields').then(({ data }) => (Array.isArray(data) ? data : [])).catch(() => []);
     }
-    return this._tfCache.find((f) => f.label === label) || null;
+    const list = await this._tfCacheP;
+    const norm = (s) => String(s || '').trim().toLowerCase();
+    // Match by label case-insensitively, then by the cf_ name Freshdesk derives —
+    // a duplicate 409 means one of these already exists, so reuse it not recreate.
+    return list.find((f) => norm(f.label) === norm(label)) || null;
   }
 
   // Resolve a Freshdesk default-role name → its account-specific role_id.
-  // Cached: /roles is a small, static list per account.
+  // Promise-memoized: /roles is fetched once, shared across concurrent callers.
   async roleIdByName(name) {
-    if (!this._roleCache) {
-      const { data } = await this.http.get('/roles');
-      this._roleCache = new Map((Array.isArray(data) ? data : []).map((r) => [String(r.name).toLowerCase(), r.id]));
-    }
-    return this._roleCache.get(String(name).toLowerCase()) || null;
+    this._roleCacheP ||= this.http.get('/roles')
+      .then(({ data }) => new Map((Array.isArray(data) ? data : []).map((r) => [String(r.name).toLowerCase(), r.id])))
+      .catch(() => new Map());
+    const cache = await this._roleCacheP;
+    return cache.get(String(name).toLowerCase()) || null;
   }
 
   // Ensure the searchable provenance custom fields exist (create once, reuse on
@@ -221,42 +302,45 @@ export class FreshdeskTarget {
   // field can't be created, its name is null and the connector simply skips it —
   // never blocks ticket migration. Freshdesk derives the cf_ name from the label.
   async ensureMigrationFields() {
-    if (this._migrationFields) return this._migrationFields;
-    const WANTED = {
-      originalId: 'Original Ticket ID',
-      sourcePlatform: 'Source Platform',
-    };
-    let existing = new Map();
-    try {
-      const { data } = await this.http.get('/admin/ticket_fields');
-      existing = new Map((Array.isArray(data) ? data : []).map((f) => [f.label, f.name]));
-    } catch { /* fall through to create */ }
-    const out = {};
-    for (const [key, label] of Object.entries(WANTED)) {
-      if (existing.has(label)) { out[key] = existing.get(label); continue; }
+    // Promise-memoized: called on EVERY ticket create, which under the concurrent
+    // worker pool means many simultaneous callers — they must share ONE creation,
+    // or the account fills with duplicate "Original Ticket ID" fields.
+    this._migrationFieldsP ||= (async () => {
+      const WANTED = { originalId: 'Original Ticket ID', sourcePlatform: 'Source Platform' };
+      let existing = new Map();
       try {
-        const { data } = await this.http.post('/admin/ticket_fields', {
-          body: { label, label_for_customers: label, type: 'custom_text', customers_can_edit: false },
-        });
-        out[key] = data.name;
-      } catch { out[key] = null; }
-    }
-    this._migrationFields = out;
-    return out;
+        const { data } = await this.http.get('/admin/ticket_fields');
+        existing = new Map((Array.isArray(data) ? data : []).map((f) => [f.label, f.name]));
+      } catch { /* fall through to create */ }
+      const out = {};
+      for (const [key, label] of Object.entries(WANTED)) {
+        if (existing.has(label)) { out[key] = existing.get(label); continue; }
+        try {
+          const { data } = await this.http.post('/admin/ticket_fields', {
+            body: { label, label_for_customers: label, type: 'custom_text', customers_can_edit: false },
+          });
+          out[key] = data.name;
+        } catch { out[key] = null; }
+      }
+      return out;
+    })();
+    return this._migrationFieldsP;
   }
 
   // Canned responses must live in a folder. Find/create one and cache its id,
   // so macro replies (→ canned responses) have a valid parent.
   async ensureCannedFolder(name = 'Migrated from Zendesk') {
-    if (this._cannedFolderId) return this._cannedFolderId;
-    try {
-      const { data } = await this.http.get('/canned_response_folders');
-      const found = (Array.isArray(data) ? data : []).find((f) => f.name === name);
-      if (found) { this._cannedFolderId = found.id; return found.id; }
-    } catch { /* fall through to create */ }
-    const { data } = await this.http.post('/canned_response_folders', { body: { name } });
-    this._cannedFolderId = data.id;
-    return data.id;
+    // Promise-memoized so concurrent macro loads share one folder create.
+    this._cannedFolderP ||= (async () => {
+      try {
+        const { data } = await this.http.get('/canned_response_folders');
+        const found = (Array.isArray(data) ? data : []).find((f) => f.name === name);
+        if (found) return found.id;
+      } catch { /* fall through to create */ }
+      const { data } = await this.http.post('/canned_response_folders', { body: { name } });
+      return data.id;
+    })();
+    return this._cannedFolderP;
   }
 
   // Dedup: reuse an existing contact/company instead of creating a duplicate.
@@ -285,6 +369,22 @@ export class NoApiError extends Error {
 }
 
 const stripTimestamps = ({ created_at, updated_at, ...rest }) => rest;
+
+// Optional ticket reference fields that must NEVER sink a whole ticket. When
+// Freshdesk 400s because one of these points at a record it can't find (an
+// assignee/group/company that didn't map, or a stale id), the retry drops just
+// that field and the ticket migrates unassigned/ungrouped — the industry
+// behaviour (Help Desk Migration does the same). requester_id/email are NOT here
+// — those are required and handled upstream (email / unique_external_id fallback).
+const DROPPABLE_REF_FIELDS = new Set(['group_id', 'responder_id', 'company_id', 'product_id']);
+function offendingRefFields(body) {
+  const errs = (body && body.errors) || [];
+  const out = new Set();
+  for (const e of errs) {
+    if (typeof e.field === 'string' && DROPPABLE_REF_FIELDS.has(e.field) && (e.code === 'invalid_value' || e.code === 'invalid_field')) out.add(e.field);
+  }
+  return [...out];
+}
 
 // True when a 400 body complains specifically about created_at/updated_at being
 // invalid — i.e. this account/plan won't accept backdated ticket timestamps.

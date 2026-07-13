@@ -2,11 +2,14 @@ import { Router } from 'express';
 import { repo, storeKind } from '../db/repository.js';
 import { config } from '../config.js';
 import { runMigration } from '../engine/orchestrator.js';
+import { computeProgress } from '../engine/progress.js';
 import { MATRIX, LOAD_ORDER } from '../mapping/matrix.js';
 import { connectionManager } from '../auth/connectionManager.js';
 import { requireAuth, login as portalLogin } from '../auth/appAuth.js';
 import { sourcePlatforms, targetPlatforms, makeSource } from '../connectors/registry.js';
 import { objectOverview, getSelection, saveSelection, getValueMap, saveValueMap, resetValueMap, getFieldMap, saveFieldMap } from '../mapping/mappingService.js';
+import { runAgentLoop } from '../agent/agentLoop.js';
+import { clearHistory as clearAgentHistory } from '../agent/store.js';
 import { log } from '../lib/logger.js';
 
 export function apiRouter() {
@@ -146,6 +149,14 @@ export function apiRouter() {
     res.json(rows);
   });
 
+  // Live load-phase progress — batch status, throughput (items/min) and ETA,
+  // aggregated from the `batches` records. Poll this during a long migration for
+  // the "which batch are we on / how fast / how much longer" view. Returns null
+  // before the first batch runs.
+  r.get('/projects/:id/progress', async (req, res, next) => {
+    try { res.json(await computeProgress(req.params.id)); } catch (e) { next(e); }
+  });
+
   // Source scan — reads live counts from the source (the same discover() the
   // orchestrator runs) so "Select data" can show how much is picked up and what
   // will migrate, before any dry run. Mapped through MATRIX for target/domain.
@@ -214,6 +225,22 @@ export function apiRouter() {
     }
     res.json(out);
   });
+
+  // ── AI migration guide (right-side assistant) ──
+  // Streamed as SSE. Auth is the same Bearer JWT (the frontend sends it via
+  // fetch headers, so requireAuth above already ran). The body carries the live
+  // wizard state so the guide knows exactly where the user is.
+  r.post('/agent', async (req, res) => {
+    const { message = '', migrationState = {}, isSystemTrigger = false } = req.body || {};
+    try {
+      await runAgentLoop(req, res, { message, migrationState, isSystemTrigger });
+    } catch (e) {
+      log.error(`agent route error: ${e.message}`);
+      if (!res.headersSent) res.status(500).json({ error: e.message });
+      else { try { res.write(`data: ${JSON.stringify({ type: 'text', content: 'Something went wrong.' })}\n\n`); res.write('data: {"type":"done"}\n\n'); res.end(); } catch { /* already closed */ } }
+    }
+  });
+  r.delete('/agent/history', async (req, res) => { await clearAgentHistory(req.appUserId); res.json({ cleared: true }); });
 
   // Error handler — surfaces reauth prompts distinctly.
   r.use((err, _req, res, _next) => {

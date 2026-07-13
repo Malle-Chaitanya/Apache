@@ -127,15 +127,28 @@ function Ring({ pct, label }) {
   );
 }
 
+// Format an ETA in minutes as a friendly "~Xm" / "~Xh Ym" string.
+function fmtEta(mins) {
+  if (mins == null) return null;
+  const m = Math.round(mins);
+  if (m < 1) return '<1m';
+  if (m < 60) return `~${m}m`;
+  return `~${Math.floor(m / 60)}h ${m % 60}m`;
+}
+
 // In-progress dashboard for the running dry run / live migration.
-export function Progress({ report, matrix, mode }) {
-  const t = report?.totals || {};
+export function Progress({ report, matrix, progress, mode }) {
+  // Derive ALL counts from the live matrix — never the report. During a run the
+  // stored report is still the PREVIOUS run's (e.g. the dry run), so mixing it in
+  // made the ring read 100% with 0 errors while tickets were still loading/failing.
   const rows = matrix || [];
-  const source = t.source ?? rows.reduce((a, r) => a + (r.source || 0), 0);
-  const done = (t.migrated || 0) + (t.validated || 0) || rows.reduce((a, r) => a + (r.migrated || 0) + (r.validated || 0), 0);
-  const manual = t.manual ?? rows.reduce((a, r) => a + (r.manual || 0), 0);
-  const failed = t.failed ?? rows.reduce((a, r) => a + (r.failed || 0), 0);
-  const pct = source ? ((done + manual + failed) / source) * 100 : 0;
+  const source = rows.reduce((a, r) => a + (r.source || 0), 0);
+  const done = rows.reduce((a, r) => a + (r.migrated || 0) + (r.validated || 0), 0);
+  const manual = rows.reduce((a, r) => a + (r.manual || 0), 0);
+  const failed = rows.reduce((a, r) => a + (r.failed || 0), 0);
+  // Cap at 99% until the run is actually finished (the parent swaps to the
+  // completion view on terminal status); 100% should mean done, not "counts add up".
+  const pct = source ? Math.min(99, ((done + manual + failed) / source) * 100) : 0;
   const cells = [
     ['Objects', source, ''],
     [mode === 'dry' ? 'Would migrate' : 'Migrated', done, 'green'],
@@ -152,6 +165,16 @@ export function Progress({ report, matrix, mode }) {
           {cells.map(([l, n, c]) => <div className={`kpi ${c}`} key={l}><div className="n">{(n ?? 0).toLocaleString()}</div><div className="l">{l}</div></div>)}
         </div>
       </div>
+      {progress?.throughputPerMin > 0 && (
+        <div className="progress-live">
+          <span><b>{progress.throughputPerMin.toLocaleString()}</b> records/min</span>
+          {progress.eta && <span>ETA <b>{fmtEta(progress.eta.etaMinutes)}</b></span>}
+          {!!progress.activeBatches?.length && (
+            <span>Loading <b>{progress.activeBatches[0].entityType}</b> · batch #{progress.activeBatches[0].seq + 1}</span>
+          )}
+          <span className="muted">{progress.totals.batches.done}/{progress.totals.batches.total} batches</span>
+        </div>
+      )}
     </div>
   );
 }

@@ -4,6 +4,7 @@
 //   ctx.addConflict(kind, detail, suggestion)
 // No inference/LLM anywhere — pure rules + value maps.
 import { mapStatus, mapPriority, mapSource, mapFieldType, ROLE_DEFAULT, mapAgentRole } from '../valueMaps.js';
+import { transformSla } from './sla.js';
 
 const asId = (v) => (v == null ? null : Number(v));
 
@@ -60,7 +61,13 @@ export const transformers = {
 
   businessHours: (r) => ({ payload: { name: r.name, time_zone: r.time_zone, business_hours: r.intervals } }),
 
-  sla: (r) => ({ payload: { name: r.title, sla_target: r.policy_metrics } }),
+  // Zendesk SLA policy → Freshdesk SLA policy. See src/mapping/transformers/sla.js
+  // (extracted for readability + unit tests). Freshdesk MANDATES all 4 priorities
+  // and respond+resolve+business_hours+escalation on each (proven live), so unset
+  // targets are defaulted and every default is REPORTED. A scope Freshdesk can't
+  // faithfully reproduce (priority/brand/tags conditions, OR-logic, or applies-to-all)
+  // is checklisted — never silently broad-applied to a contract object.
+  sla: (r, ctx) => transformSla(r, ctx),
 
   // ── automation logic translation → intermediate representation (IR) ──
   trigger: (r, ctx) => translateRule(r, 'trigger', ctx),
@@ -142,7 +149,26 @@ export const transformers = {
       if (coerced !== undefined) cfv[name] = coerced;
     }
     if (Object.keys(cfv).length) payload.custom_fields = { ...(payload.custom_fields || {}), ...cfv };
-    if (!payload.requester_id) ctx.addConflict('unmapped_field', `Ticket "${(r.subject || '').slice(0, 40)}" requester not among migrated contacts — Freshdesk needs a requester.`, 'Migrate the requester (end-user), or set a default requester.');
+    // Freshdesk needs a requester. If the source requester wasn't migrated as a
+    // contact (it's an agent, or an end-user outside the selected set), fall back
+    // to the requester's EMAIL — Freshdesk find-or-creates the contact from it,
+    // so the ticket migrates instead of 400-ing on "requester_id required". Only
+    // when we have NEITHER is the ticket un-migratable → conflict.
+    if (!payload.requester_id) {
+      if (r.requester_email) {
+        payload.email = r.requester_email;
+      } else if (r.requester_id) {
+        // Emailless Zendesk requester (phone-only / API-created / bulk contact).
+        // Freshdesk accepts unique_external_id as a requester identifier — key a
+        // placeholder contact on the Zendesk user id (+ name) so the ticket
+        // migrates with a distinct, stable requester instead of being dropped.
+        payload.unique_external_id = String(r.requester_id);
+        payload.name = r.requester_name || `Zendesk user ${r.requester_id}`;
+        ctx.addConflict('unmapped_field', `Ticket "${(r.subject || '').slice(0, 40)}" requester "${payload.name}" has no email in Zendesk — migrated with a placeholder contact keyed on the source id.`, 'Add an email to this contact in Freshdesk if you need to reach them.');
+      } else {
+        ctx.addConflict('unmapped_field', `Ticket "${(r.subject || '').slice(0, 40)}" has no requester — Freshdesk needs one.`, 'Set a default requester for orphaned tickets.');
+      }
+    }
     const comments = r.comments || [];
     // Zendesk's FIRST comment IS the ticket description. Re-importing it as a
     // reply produces a DUPLICATE opening message (a real migration bug), so skip

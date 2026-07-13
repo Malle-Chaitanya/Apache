@@ -26,6 +26,10 @@ export const config = {
   mongoUri: buildMongoUri(),
   oauthRedirectUri: process.env.OAUTH_REDIRECT_URI || 'http://localhost:5173/',
   batchSize: num(process.env.BATCH_SIZE, 100),
+  // Parallel workers per object type at load time. The shared per-connector rate
+  // limiter still caps total throughput, so this just keeps the pipe full up to
+  // the API's rpm without 429 storms. Keep modest (5–10).
+  concurrency: num(process.env.MIGRATION_CONCURRENCY, 6),
   zendesk: {
     subdomain: process.env.ZENDESK_SUBDOMAIN || '',
     email: process.env.ZENDESK_EMAIL || '',

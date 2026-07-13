@@ -90,6 +90,11 @@ export function Mapping({ projectId }) {
 // map (Tier 2) for enum fields — the two-tier structure of a mature wizard.
 function MappingModal({ projectId, type, onClose }) {
   const [view, setView] = useState('fields'); // 'fields' | <valueMapName>
+  const inValues = view !== 'fields';
+  // Top-right control follows the drill-in hierarchy: from a value map it backs
+  // up to the field list (← ), and only closes the whole modal (×) at the top
+  // level — so opening a value map and dismissing it never tears down the ticket
+  // mapping. Click outside (backdrop) still fully closes from any level.
   return (
     <div className="modal-backdrop" onClick={onClose}>
       <div className="modal" onClick={(e) => e.stopPropagation()}>
@@ -98,7 +103,7 @@ function MappingModal({ projectId, type, onClose }) {
             <b>Field &amp; value mapping — {type}</b>
             <div className="hint" style={{ margin: 0 }}>{view === 'fields' ? 'Match each Zendesk field to its Freshdesk destination. Enum fields open a value map.' : 'Zendesk value → Freshdesk value. Blank/unmatched values use the “Use for empty values” default.'}</div>
           </div>
-          <button className="x" onClick={onClose}>×</button>
+          <button className="x" title={inValues ? 'Back to fields' : 'Close'} onClick={inValues ? () => setView('fields') : onClose}>{inValues ? '←' : '×'}</button>
         </div>
         {view === 'fields'
           ? <FieldsPanel projectId={projectId} type={type} onEditValues={setView} onClose={onClose} />

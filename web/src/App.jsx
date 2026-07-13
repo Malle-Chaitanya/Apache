@@ -5,6 +5,7 @@ import Logo from './Logo.jsx';
 import { Stepper, ReauthBanner, Configure, Kpis, MatrixTable, Report, Progress, DryRunSummary } from './steps.jsx';
 import { ConnectPlatforms, PairPicker } from './Clouds.jsx';
 import { Mapping } from './Mapping.jsx';
+import AgentGuide from './AgentGuide.jsx';
 
 // The migration steps, in the order a real migration runs.
 const STEPS = [
@@ -31,14 +32,21 @@ export default function App() {
   const [scan, setScan] = useState(null);
   const [scanning, setScanning] = useState(false);
   const [matrix, setMatrix] = useState([]);
+  const [progress, setProgress] = useState(null);
   const [report, setReport] = useState(null);
   const [conflicts, setConflicts] = useState([]);
   const [running, setRunning] = useState(false);
   const [dryDone, setDryDone] = useState(false);
   const [liveDone, setLiveDone] = useState(false);
+  // Guide panel: user-resizable width + which side it sits on (persisted).
+  const [guideWidth, setGuideWidth] = useState(() => { const v = Number(localStorage.getItem('cf_guide_w')); return v >= 300 && v <= 720 ? v : 400; });
+  const [guideSwapped, setGuideSwapped] = useState(() => localStorage.getItem('cf_guide_swap') === '1');
+  const guideWidthRef = useRef(guideWidth);
+  guideWidthRef.current = guideWidth;
   const poll = useRef(null);
   const runModeRef = useRef(null);   // 'dry' | 'live' — read inside the poll closure
   const armedRef = useRef(false);    // have we observed THIS run actually running yet?
+  const activeProjectIdRef = useRef(null); // id of the project the current run polls — decoupled from state timing (the guide can start a run on a just-created project)
 
   useEffect(() => {
     (async () => {
@@ -95,9 +103,10 @@ export default function App() {
   }, [key, project]);
 
   async function refreshRun() {
-    const id = project._id;
-    const [p, m, r, c] = await Promise.all([api.getProject(id), api.matrix(id), api.report(id), api.conflicts(id)]);
-    setProject(p); setMatrix(m); setReport(r); setConflicts(c);
+    const id = activeProjectIdRef.current || project?._id;
+    if (!id) return;
+    const [p, m, r, c, pr] = await Promise.all([api.getProject(id), api.matrix(id), api.report(id), api.conflicts(id), api.progress(id).catch(() => null)]);
+    setProject(p); setMatrix(m); setReport(r); setConflicts(c); setProgress(pr);
     const terminal = ['completed', 'failed', 'reauth_required'].includes(p.status);
     // Once we've seen the run actually running, a terminal status means done.
     // Until then, ignore a terminal status left over from a PREVIOUS run — this
@@ -109,14 +118,16 @@ export default function App() {
     if (p.status === 'completed') { if (runModeRef.current === 'dry') setDryDone(true); if (runModeRef.current === 'live') setLiveDone(true); }
     if (p.status === 'reauth_required') refreshAccounts();
   }
-  function startRun(dryRun) {
+  function startRun(dryRun, projId = project?._id) {
+    if (!projId) return;
+    activeProjectIdRef.current = projId;
     setRunning(true); runModeRef.current = dryRun ? 'dry' : 'live'; armedRef.current = false;
     if (dryRun) setDryDone(false); else setLiveDone(false);
     // Clear any prior run's report/matrix so the progress ring starts at 0 and
     // climbs — otherwise the just-finished dry run's counts read as 100% until
     // the backend re-extracts and resets record statuses.
-    setReport(null); setMatrix([]); setConflicts([]);
-    api.run(project._id, dryRun).catch(() => {});
+    setReport(null); setMatrix([]); setConflicts([]); setProgress(null);
+    api.run(projId, dryRun).catch(() => {});
     clearInterval(poll.current);
     poll.current = setInterval(refreshRun, 1000);
   }
@@ -125,25 +136,88 @@ export default function App() {
     clearInterval(poll.current); setRunning(false);
     runModeRef.current = null; armedRef.current = false;
     setDryDone(false); setLiveDone(false);
-    setMatrix([]); setReport(null); setConflicts([]); setScan(null);
+    setMatrix([]); setReport(null); setConflicts([]); setScan(null); setProgress(null);
   }
   function resetToStart() {
     clearRunState(); setProject(null); setPair({ sourceAccountId: '', targetAccountId: '' }); setStep(0);
   }
   function signOut() { resetToStart(); auth.logout(); setUser(null); setAccounts([]); }
 
+  // ── Draggable / swappable guide panel (GEM_CO parity) ──
+  function swapGuide() {
+    setGuideSwapped((s) => { const n = !s; localStorage.setItem('cf_guide_swap', n ? '1' : '0'); return n; });
+  }
+  function startDividerDrag(e) {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startW = guideWidthRef.current;
+    const swapped = guideSwapped; // guide on the left → drag right widens it
+    const onMove = (ev) => {
+      const dx = ev.clientX - startX;
+      const w = Math.max(300, Math.min(720, swapped ? startW + dx : startW - dx));
+      guideWidthRef.current = w; setGuideWidth(w);
+    };
+    const onUp = () => {
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+      document.body.style.userSelect = ''; document.body.style.cursor = '';
+      localStorage.setItem('cf_guide_w', String(Math.round(guideWidthRef.current)));
+    };
+    document.body.style.userSelect = 'none'; document.body.style.cursor = 'col-resize';
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  }
+
+  // Create (or reuse) the project bound to a source/target account pair. Shared
+  // by the manual pair → select flow and the AI guide's navigation.
+  async function ensureProject(sp, tp) {
+    const needNew = !project || project.source?.accountId !== sp || project.target?.accountId !== tp;
+    if (!needNew) return project;
+    clearRunState();
+    const srcAcct = accounts.find((a) => a._id === sp);
+    const tgtAcct = accounts.find((a) => a._id === tp);
+    const name = `${cap(srcAcct?.platform)} → ${cap(tgtAcct?.platform)}`;
+    const p = await api.createProject({ name, source: { accountId: sp }, target: { accountId: tp } });
+    setProject(p);
+    return p;
+  }
+
   // pair → select: create the project silently, bound to the chosen accounts.
   async function goToSelect() {
-    const srcAcct = accounts.find((a) => a._id === pair.sourceAccountId);
-    const tgtAcct = accounts.find((a) => a._id === pair.targetAccountId);
-    const needNew = !project || project.source?.accountId !== pair.sourceAccountId || project.target?.accountId !== pair.targetAccountId;
-    if (needNew) {
-      clearRunState();
-      const name = `${cap(srcAcct?.platform)} → ${cap(tgtAcct?.platform)}`;
-      const p = await api.createProject({ name, source: { accountId: pair.sourceAccountId }, target: { accountId: pair.targetAccountId } });
-      setProject(p);
-    }
+    await ensureProject(pair.sourceAccountId, pair.targetAccountId);
     setStep(idx('select'));
+  }
+
+  // ── AI guide drives the same wizard the user clicks ─────────────────────────
+  // Resolve the account pair, defaulting to the single connected account per side.
+  function resolvePair() {
+    const sp = pair.sourceAccountId || (srcConnected.length === 1 ? srcConnected[0]._id : '');
+    const tp = pair.targetAccountId || (tgtConnected.length === 1 ? tgtConnected[0]._id : '');
+    if (sp && tp && (!pair.sourceAccountId || !pair.targetAccountId)) setPair({ sourceAccountId: sp, targetAccountId: tp });
+    return { sp, tp };
+  }
+  // Guarded navigation: clamp to reachable steps and create the project on the
+  // way into Select Data (mirrors the manual pair → select flow).
+  async function agentNavigate(target) {
+    const t = Math.max(0, Math.min(STEPS.length - 1, target));
+    const both = srcConnected.length > 0 && tgtConnected.length > 0;
+    if (t >= idx('pair') && !both) { setStep(idx('connect')); return; }
+    if (t >= idx('select')) {
+      const { sp, tp } = resolvePair();
+      if (!sp || !tp) { setStep(idx('pair')); return; }
+      await ensureProject(sp, tp);
+    }
+    setStep(t);
+  }
+  // Start a dry run / live run from the guide: ensure prerequisites, land on the
+  // right step, then run against the (possibly just-created) project id.
+  async function agentStartRun(dryRun) {
+    if (srcConnected.length === 0 || tgtConnected.length === 0) { setStep(idx('connect')); return; }
+    const { sp, tp } = resolvePair();
+    if (!sp || !tp) { setStep(idx('pair')); return; }
+    const p = await ensureProject(sp, tp);
+    setStep(idx(dryRun ? 'precheck' : 'migrate'));
+    startRun(dryRun, p._id);
   }
 
   if (booting) return null;
@@ -192,9 +266,30 @@ export default function App() {
     return null;
   };
 
-  return (
-    <>
-      {topbar}
+  // Live snapshot + drive-actions handed to the AI migration guide.
+  const guideCtx = {
+    state: {
+      step, stepKey: key,
+      srcPlatform: sources[0] || 'zendesk', tgtPlatform: targets[0] || 'freshdesk',
+      srcConnectedCount: srcConnected.length, tgtConnectedCount: tgtConnected.length,
+      bothConnected: srcConnected.length > 0 && tgtConnected.length > 0,
+      hasProject: !!project, projectId: project?._id || null, projectStatus: project?.status || 'none',
+      scope: { migrateConfig: options.migrateConfig, migrateData: options.migrateData },
+      scan: scan ? { config: scan.totals?.config, data: scan.totals?.data, all: scan.totals?.all } : null,
+      running, runMode: running ? runModeRef.current : null,
+      dryDone, liveDone,
+      reportTotals: report?.totals || null,
+      userName: user?.name || '',
+    },
+    actions: {
+      navigate: agentNavigate,
+      setScope: (patch) => setOptions((o) => ({ ...o, ...patch })),
+      startRun: agentStartRun,
+    },
+  };
+
+  const guidePanel = <AgentGuide ctx={guideCtx} width={guideWidth} swapped={guideSwapped} onSwap={swapGuide} />;
+  const wizard = (
       <main>
         <Stepper steps={STEPS} current={step} />
         <ReauthBanner connections={boundForBanner} onReconnect={() => setStep(idx('connect'))} />
@@ -208,7 +303,7 @@ export default function App() {
         {key === 'mapping' && <Mapping projectId={project?._id} />}
 
         {key === 'precheck' && (running ? (
-          <Progress report={report} matrix={matrix} mode="dry" />
+          <Progress report={report} matrix={matrix} progress={progress} mode="dry" />
         ) : dryDone ? (
           <DryRunSummary report={report} matrix={matrix} running={running} onGoLive={() => { setStep(idx('migrate')); startRun(false); }} />
         ) : (
@@ -220,7 +315,7 @@ export default function App() {
         ))}
 
         {key === 'migrate' && (running ? (
-          <Progress report={report} matrix={matrix} mode="live" />
+          <Progress report={report} matrix={matrix} progress={progress} mode="live" />
         ) : liveDone ? (
           <><Kpis totals={report?.totals} />{!!matrix.length && <MatrixTable rows={matrix} />}</>
         ) : (
@@ -239,6 +334,16 @@ export default function App() {
           {nextButton()}
         </div>
       </main>
+  );
+
+  return (
+    <>
+      {topbar}
+      <div className={`workspace${guideSwapped ? ' swapped' : ''}`}>
+        {guideSwapped ? guidePanel : wizard}
+        <div className="guide-divider" onMouseDown={startDividerDrag} title="Drag to resize" />
+        {guideSwapped ? wizard : guidePanel}
+      </div>
     </>
   );
 }

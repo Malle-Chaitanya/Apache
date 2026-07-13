@@ -1,4 +1,4 @@
-import { makeCredential } from './credential.js';
+import { makeCredential, bareInstance } from './credential.js';
 
 // ─────────────────────────────────────────────────────────────
 // AuthStrategy layer. One uniform "Connect" UX; the strategy behind it varies
@@ -85,6 +85,7 @@ class FormStrategy {
 class OAuthStrategy {
   describe(platform) { return { authType: 'oauth', mode: 'redirect', instanceField: PLATFORMS[platform].instanceField || null }; }
   authorizeUrl(platform, { instance, state, redirectUri }) {
+    instance = bareInstance(instance);
     const o = PLATFORMS[platform].oauth;
     const p = new URLSearchParams({
       response_type: 'code', client_id: env(o.clientIdEnv), redirect_uri: redirectUri,
@@ -94,6 +95,7 @@ class OAuthStrategy {
     return `${o.authorizeUrl(instance)}?${p.toString()}`;
   }
   async exchangeCode(platform, { code, redirectUri, instance }) {
+    instance = bareInstance(instance);
     const o = PLATFORMS[platform].oauth;
     const t = await postToken(o.tokenUrl(instance), {
       grant_type: 'authorization_code', code, client_id: env(o.clientIdEnv), client_secret: env(o.clientSecretEnv),
