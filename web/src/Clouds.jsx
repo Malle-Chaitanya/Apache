@@ -13,12 +13,26 @@ const FIELDS = {
   servicenow: { instance_oauth: ['instanceUrl', 'clientId', 'clientSecret', 'username', 'password'] },
 };
 const LABEL = {
-  subdomain: ['Zendesk subdomain', 'yourcompany'], domain: ['Freshdesk domain', 'yourcompany.freshdesk.com'],
+  subdomain: ['Zendesk domain or URL', 'yourcompany.zendesk.com'], domain: ['Freshdesk domain or URL', 'yourcompany.freshdesk.com'],
   email: ['Admin email', 'you@company.com'], apiToken: ['API token', '••••••••'], apiKey: ['API key', '••••••••'],
   instanceUrl: ['Instance URL', 'https://yourcompany.service-now.com'], clientId: ['Client ID', ''], clientSecret: ['Client secret', '••••••••'],
   username: ['Integration user', ''], password: ['Password', '••••••••'],
 };
 const SECRET_FIELDS = new Set(['apiToken', 'apiKey', 'clientSecret', 'password']);
+// Fields where the user may paste a full URL but the backend expects a bare host slug.
+const HOST_FIELDS = new Set(['subdomain', 'domain']);
+// Reduce a pasted URL / host / slug to the bare instance slug (mirrors backend
+// bareInstance in src/auth/credential.js) so "acme.freshdesk.com" doesn't become
+// "acme.freshdesk.com.freshdesk.com". Also gives instant, clean UX on blur.
+function bareInstance(raw) {
+  if (typeof raw !== 'string') return raw;
+  let s = raw.trim();
+  if (!s) return s;
+  s = s.replace(/^[a-z][a-z0-9+.-]*:\/\//i, '');
+  s = s.split(/[/?#]/)[0].split('@').pop().split(':')[0];
+  s = s.replace(/\.(zendesk|freshdesk|freshservice|myfreshworks)\.com$/i, '');
+  return s.replace(/\.+$/, '').toLowerCase();
+}
 const AUTH_LABEL = { api_token: 'API token', api_key: 'API key', oauth: 'OAuth (click-consent)', instance_oauth: 'Instance OAuth' };
 
 // Add or reconnect a cloud account. `existing` → reconnect that account.
@@ -33,17 +47,20 @@ export function AccountForm({ platform, existing, onDone, onCancel }) {
 
   async function save() {
     setBusy(true); setError('');
+    // Reduce any pasted URL in host fields to the bare slug before sending.
+    const clean = { ...values };
+    for (const k of HOST_FIELDS) if (clean[k] != null) clean[k] = bareInstance(clean[k]);
     try {
       if (isOAuth) {
-        const out = await api.beginAddAccount({ platform, authType, instance: values.subdomain });
+        const out = await api.beginAddAccount({ platform, authType, instance: clean.subdomain });
         // Same-window redirect → provider sends the browser back to the app
         // (redirect_uri), which captures ?code&state on load and completes.
         if (out.redirectUrl) { window.location.href = out.redirectUrl; return; }
         onDone(null);
       } else if (existing) {
-        onDone(await api.reconnectAccount(existing._id, { platform, authType, fields: values, instance: values.subdomain }));
+        onDone(await api.reconnectAccount(existing._id, { platform, authType, fields: clean, instance: clean.subdomain }));
       } else {
-        onDone(await api.completeAddAccount({ platform, authType, fields: values, instance: values.subdomain }));
+        onDone(await api.completeAddAccount({ platform, authType, fields: clean, instance: clean.subdomain }));
       }
     } catch (e) { setError(e.message); setBusy(false); }
   }
@@ -60,7 +77,8 @@ export function AccountForm({ platform, existing, onDone, onCancel }) {
         <div className="field" key={f}>
           <label>{LABEL[f]?.[0] || f}</label>
           <input type={SECRET_FIELDS.has(f) ? 'password' : 'text'} placeholder={LABEL[f]?.[1] || ''}
-            value={values[f] || ''} onChange={(e) => set(f, e.target.value)} />
+            value={values[f] || ''} onChange={(e) => set(f, e.target.value)}
+            onBlur={HOST_FIELDS.has(f) ? (e) => e.target.value && set(f, bareInstance(e.target.value)) : undefined} />
         </div>
       ))}
       {isOAuth && <div className="hint">Opens the {platform} consent screen. Requires the registered OAuth app.</div>}

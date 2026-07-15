@@ -359,6 +359,20 @@ export const CloudAccountSchema = new Schema({
 CloudAccountSchema.index({ appUserId: 1, platform: 1 });
 
 // ═══════════════════════════════════════════════════════════════
+// AI migration guide — per-user chat with the right-side assistant
+// (GEM_CO parity: chatHistory). One doc per appUser holds the rolling
+// message history plus any pending confirmation (e.g. "go live?") so a
+// destructive action survives the round-trip between turns. No sessions —
+// the JWT-derived appUserId is the key.
+// ═══════════════════════════════════════════════════════════════
+export const AgentChatSchema = new Schema({
+  appUserId: ref('appUsers'),                       // owner — one chat per user
+  messages: [{ role: String, content: String, at: Date }],
+  pendingAction: Object,                            // { tool, args } awaiting "Yes, proceed"
+}, opts);
+AgentChatSchema.index({ appUserId: 1 }, { unique: true });
+
+// ═══════════════════════════════════════════════════════════════
 // Registries — consumed by the repository adapter & bootstrap
 // ═══════════════════════════════════════════════════════════════
 
@@ -389,6 +403,8 @@ export const CONTROL_COLLECTIONS = {
   conflicts: ConflictSchema,
   events: EventSchema,
   reports: ReportSchema,
+  // AI migration guide
+  agentChats: AgentChatSchema,
 };
 
 // Staging collections — one per object type, all sharing EntitySchema.

@@ -53,6 +53,7 @@ export const api = {
   run: (id, dryRun) => post(`/api/projects/${id}/run`, { dryRun }),
   scan: (id) => get(`/api/projects/${id}/scan`),
   matrix: (id) => get(`/api/projects/${id}/matrix`),
+  progress: (id) => get(`/api/projects/${id}/progress`),
 
   // Mapping layer (Select Objects · Field & Value Mapping)
   mappingOverview: (id) => get(`/api/projects/${id}/mapping/overview`),
@@ -68,4 +69,9 @@ export const api = {
   conflicts: (id) => get(`/api/projects/${id}/conflicts`),
   events: (id, n = 500) => get(`/api/projects/${id}/events?n=${n}`),
   failures: (id) => get(`/api/projects/${id}/failures`),
+
+  // AI migration guide — POSTs the live wizard state and streams the reply back
+  // as SSE. Returns the raw Response so the caller can read res.body itself.
+  agentChat: (body) => fetch('/api/agent', { method: 'POST', headers: hdr(true), body: JSON.stringify(body || {}) }),
+  clearAgentHistory: () => del('/api/agent/history'),
 };

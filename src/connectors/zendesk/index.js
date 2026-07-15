@@ -50,14 +50,21 @@ export class ZendeskSource {
   async list(type) {
     const m = MAP[type];
     if (!m) return [];
-    const out = [];
-    let path = m.path;
-    let query = { ...(m.query || {}), per_page: 100 };
-    while (path) {
-      const { data } = await this.http.get(path, { query });
-      out.push(...(data[m.key] || []));
-      path = data.next_page ? data.next_page.replace(this.baseUrl, '') : null;
-      query = undefined;
+    let out = [];
+    if (type === 'tickets') {
+      // Incremental export: 1000/page AND includes ARCHIVED tickets — the standard
+      // /tickets.json omits closed tickets older than 120 days, so a plain list
+      // silently under-migrates an established Zendesk. This is the correct bulk path.
+      out = await this._incrementalTickets();
+    } else {
+      let path = m.path;
+      let query = { ...(m.query || {}), per_page: 100 };
+      while (path) {
+        const { data } = await this.http.get(path, { query });
+        out.push(...(data[m.key] || []));
+        path = data.next_page ? data.next_page.replace(this.baseUrl, '') : null;
+        query = undefined;
+      }
     }
     // Zendesk keeps group membership OUT of the user object — join it in so
     // agents migrate WITH their groups (Freshdesk needs the agent in the ticket's
@@ -66,6 +73,20 @@ export class ZendeskSource {
     // CC/collaborators are user ids on the ticket; Freshdesk wants emails → resolve.
     if (type === 'tickets') await this._attachCollaboratorEmails(out);
     return out;
+  }
+
+  // All tickets via the Incremental Export API (1000/page, includes archived).
+  // Dedupes across cursor boundaries and drops soft-deleted tickets.
+  async _incrementalTickets(startTime = 0) {
+    const byId = new Map();
+    let url = `/incremental/tickets.json?start_time=${startTime}`;
+    while (url) {
+      const { data } = await this.http.get(url);
+      for (const t of data.tickets || []) if (t.status !== 'deleted') byId.set(t.id, t);
+      if (data.end_of_stream || !data.next_page) break;
+      url = data.next_page.replace(this.baseUrl, '');
+    }
+    return [...byId.values()];
   }
 
   async _attachGroupMemberships(agents) {
@@ -85,16 +106,31 @@ export class ZendeskSource {
   }
 
   async _attachCollaboratorEmails(tickets) {
-    const ids = [...new Set(tickets.flatMap((t) => t.collaborator_ids || []))];
+    // Resolve emails for BOTH collaborators and requesters. The requester email is
+    // the fallback Freshdesk uses when the requester wasn't migrated as a contact
+    // (e.g. the requester is an agent, or an end-user outside the selected set) —
+    // without it, those tickets 400 on "requester_id required" and are lost.
+    const ids = [...new Set([
+      ...tickets.flatMap((t) => t.collaborator_ids || []),
+      ...tickets.map((t) => t.requester_id).filter(Boolean),
+    ])];
     if (!ids.length) return;
     const emailById = new Map();
+    const nameById = new Map();
     for (let i = 0; i < ids.length; i += 100) {
       try {
         const { data } = await this.http.get('/users/show_many.json', { query: { ids: ids.slice(i, i + 100).join(',') } });
-        for (const u of data.users || []) if (u.email) emailById.set(u.id, u.email);
+        for (const u of data.users || []) { if (u.email) emailById.set(u.id, u.email); if (u.name) nameById.set(u.id, u.name); }
       } catch { /* best-effort */ }
     }
-    for (const t of tickets) t.collaborator_emails = (t.collaborator_ids || []).map((id) => emailById.get(id)).filter(Boolean);
+    for (const t of tickets) {
+      t.collaborator_emails = (t.collaborator_ids || []).map((id) => emailById.get(id)).filter(Boolean);
+      // Requester email + name for the transformer's fallback chain. Some Zendesk
+      // requesters are EMAILLESS (phone-only / API-created / bulk) — no email at
+      // all — so we also carry the name to build a unique_external_id placeholder.
+      t.requester_email = emailById.get(t.requester_id) || null;
+      t.requester_name = nameById.get(t.requester_id) || null;
+    }
   }
 
   async listComments(ticket) {

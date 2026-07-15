@@ -10,6 +10,18 @@ import { log } from '../lib/logger.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
+// Safety net: a migration runs in the background (the /run route fires
+// runMigration and returns immediately), so an async error inside it would
+// otherwise become an unhandledRejection/uncaughtException and kill the whole
+// server process — interrupting the very migration in progress. Log the real
+// error and stay up instead; the run is checkpointed and resumable.
+process.on('unhandledRejection', (reason) => {
+  log.error(`unhandledRejection: ${reason?.stack || reason}`);
+});
+process.on('uncaughtException', (err) => {
+  log.error(`uncaughtException: ${err?.stack || err}`);
+});
+
 async function main() {
   await initStore();
   await seedAppUsers();

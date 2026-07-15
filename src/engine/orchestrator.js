@@ -37,7 +37,7 @@ export async function runMigration(projectId, { dryRun = false } = {}) {
   const fieldSkips = await effectiveFieldSkips(projectId);
 
   const ctx = {
-    project, dryRun, valueMaps, selection, fieldSkips,
+    project, jobId: job._id, dryRun, valueMaps, selection, fieldSkips,
     // Provenance mode: 'clean' (default) = native-looking destination, source
     // metadata only in searchable custom fields + the migration report.
     // 'forensic' (opt-in) additionally prefixes each message with its source time.
