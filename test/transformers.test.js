@@ -140,10 +140,25 @@ test('businessHours: carries name/time_zone/intervals through, not forced-manual
   assert.notEqual(manual, true);
 });
 
-test('sla: maps title→name and policy_metrics→sla_target, not forced-manual', () => {
-  const { payload, manual } = transformers.sla({ title: 'Gold', policy_metrics: { p1: 60 } });
-  assert.deepEqual(payload, { name: 'Gold', sla_target: { p1: 60 } });
+test('sla: maps title→name, metrics→sla_target(seconds), scopes by ticket type', () => {
+  const { payload, manual } = transformers.sla({
+    title: 'Gold',
+    filter: { all: [{ field: 'ticket_type_id', operator: 'is', value: '2' }], any: [] },
+    policy_metrics: [{ priority: 'urgent', metric: 'first_reply_time', target_in_seconds: 900 }],
+  }, stubCtx());
   assert.notEqual(manual, true);
+  assert.equal(payload.name, 'Gold');
+  assert.equal(payload.sla_target.priority_4.respond_within, 900);
+  assert.deepEqual(payload.applicable_to, { ticket_types: ['Incident'] });
+});
+
+test('sla: a malformed (non-array) policy_metrics degrades gracefully, does not throw', () => {
+  const { payload } = transformers.sla({
+    title: 'Weird', filter: { all: [{ field: 'group_id', operator: 'is', value: 10 }], any: [] },
+    policy_metrics: { p1: 60 }, // not an array — must not crash
+  }, stubCtx({ 'groups:10': 501 }));
+  assert.equal(payload.name, 'Weird');
+  assert.equal(Object.keys(payload.sla_target).length, 4, 'all 4 priorities defaulted');
 });
 
 // ── triggers / automations (rule IR translation) ────────────────────────────────

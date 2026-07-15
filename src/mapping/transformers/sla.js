@@ -27,6 +27,14 @@
 
 const asId = (v) => (v == null ? null : Number(v));
 
+// Zendesk SLA scope conditions only map when they mean plain equality. A negation
+// or comparison operator (is_not, less_than, …) would INVERT or broaden the scope
+// — e.g. "type is_not Incident" naively becomes "applies to Incident", the exact
+// opposite. Such conditions are treated as UNMAPPABLE so the policy goes MANUAL
+// (faithful-or-manual, principle #2) instead of being silently wrong-scoped.
+const EQ_OPS = new Set(['is', 'is_in']);
+const isEqualityOp = (op) => op == null || op === '' || EQ_OPS.has(op);
+
 const PRI = { low: 'priority_1', normal: 'priority_2', high: 'priority_3', urgent: 'priority_4' };
 const LABEL = { priority_1: 'Low', priority_2: 'Normal', priority_3: 'High', priority_4: 'Urgent' };
 const TYPE = { question: 'Question', incident: 'Incident', problem: 'Problem', task: 'Question' };
@@ -36,6 +44,11 @@ const TYPE_ID = { 1: 'Question', 2: 'Incident', 3: 'Problem', 4: 'Question' };
 // and ALWAYS reported so an admin can correct them (never silent).
 const RESPOND_DEFAULT = 3600;   // 1h
 const RESOLVE_DEFAULT = 86400;  // 24h
+// Freshdesk rejects the WHOLE policy (HTTP 400 "must be greater than or equal to
+// 30") if any respond/resolve target is < 30s — verified live. A Zendesk target
+// under 30s (or a stray 0) is raised to this floor and reported, so one tiny
+// value can't sink an otherwise-valid contract SLA.
+const FD_MIN_TARGET = 30;
 
 const toSec = (min) => Math.max(0, Math.round((Number(min) || 0) * 60)); // Zendesk targets are MINUTES
 
@@ -50,7 +63,9 @@ export function transformSla(r, ctx) {
   // ── Targets ──────────────────────────────────────────────────────────────
   // Group Zendesk metrics by priority; prefer target_in_seconds (exact).
   const byPri = {};
-  for (const m of (r.policy_metrics || [])) {
+  // Zendesk always sends policy_metrics as an array; guard anyway so a malformed
+  // shape degrades to "all targets defaulted (+reported)" instead of throwing.
+  for (const m of (Array.isArray(r.policy_metrics) ? r.policy_metrics : [])) {
     const key = PRI[m.priority];
     if (!key) continue;
     const sec = m.target_in_seconds != null ? Number(m.target_in_seconds) : toSec(m.target);
@@ -81,6 +96,14 @@ export function transformSla(r, ctx) {
       defaults.push(`${LABEL[key]} resolution → ${(out.resolve_within / 3600).toFixed(1)}h (${respond != null ? 'derived from first-response ×8' : 'default'}; Zendesk had none)`);
     }
     if (nextRespond != null && nextRespond >= 30) out.next_respond_within = nextRespond;
+    // Clamp sub-30s targets up to Freshdesk's floor (a 0/near-0 Zendesk value would
+    // otherwise 400 the entire policy). Reported like every other adjustment.
+    for (const fld of ['respond_within', 'resolve_within']) {
+      if (out[fld] != null && out[fld] < FD_MIN_TARGET) {
+        defaults.push(`${LABEL[key]} ${fld === 'respond_within' ? 'first-response' : 'resolution'} raised to ${FD_MIN_TARGET}s (Zendesk had ${out[fld]}s; Freshdesk minimum is ${FD_MIN_TARGET}s)`);
+        out[fld] = FD_MIN_TARGET;
+      }
+    }
     return out;
   };
 
@@ -98,6 +121,10 @@ export function transformSla(r, ctx) {
 
   for (const c of allConds) {
     const f = c.field;
+    // A non-equality operator can't be reproduced as a Freshdesk applicable_to
+    // scope (which is pure equality/OR-of-equals). Flag it so the policy is MANUAL,
+    // never inverted. `describeConds` keeps the original operator for the checklist.
+    if (!isEqualityOp(c.operator)) { unmapped.push(`${f} ${c.operator}`); continue; }
     if ((f === 'type' || f === 'ticket_type') && TYPE[c.value]) push('ticket_types', TYPE[c.value]);
     else if (f === 'ticket_type_id' && TYPE_ID[Number(c.value)]) push('ticket_types', TYPE_ID[Number(c.value)]);
     else if (f === 'group_id') { const g = resolve('groups', c.value); g ? push('group_ids', asId(g)) : unmapped.push('group (not migrated)'); }

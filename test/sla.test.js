@@ -171,6 +171,49 @@ test('tag condition → MANUAL (unmappable), name/targets kept for checklist', (
   assert.ok(payload.sla_target.priority_4, 'targets preserved for the checklist');
 });
 
+test('sub-30s target is raised to Freshdesk floor (30s) and reported', (ctx, cs) => {
+  const z = base();
+  z.filter = { all: [{ field: 'group_id', value: 100 }], any: [] };
+  z.policy_metrics = [{ priority: 'urgent', metric: 'first_reply_time', target_in_seconds: 0 }]; // 0 would 400 the whole policy
+  const { payload, manual } = transformSla(z, ctx);
+  assert.ok(!manual);
+  assert.strictEqual(payload.sla_target.priority_4.respond_within, 30, '0 → clamped to FD minimum 30s');
+  assert.ok(hasConflict(cs, /raised to 30s/i), 'the clamp is reported, not silent');
+});
+
+test('operator is_not on ticket_type → MANUAL, not inverted to the excluded type', (ctx, cs) => {
+  const z = base();
+  z.filter = { all: [{ field: 'ticket_type_id', operator: 'is_not', value: '2' }], any: [] };
+  const { manual, payload } = transformSla(z, ctx);
+  assert.ok(manual, 'a negated scope must NOT be auto-created');
+  assert.ok(!payload.applicable_to, 'must not emit the inverted (Incident) scope');
+  assert.ok(hasConflict(cs, /can't target: ticket_type_id is_not/i), 'flags the negated operator');
+});
+
+test('operator is_not on group → MANUAL (would otherwise scope to the excluded group)', (ctx, cs) => {
+  const z = base();
+  z.filter = { all: [{ field: 'group_id', operator: 'is_not', value: 100 }], any: [] };
+  const { manual } = transformSla(z, ctx);
+  assert.ok(manual, 'negated group scope is unmappable');
+  assert.ok(hasConflict(cs, /group_id is_not/i));
+});
+
+test('comparison operator (less_than) → MANUAL', (ctx, cs) => {
+  const z = base();
+  z.filter = { all: [{ field: 'ticket_type_id', operator: 'less_than', value: '2' }], any: [] };
+  const { manual } = transformSla(z, ctx);
+  assert.ok(manual);
+  assert.ok(hasConflict(cs, /less_than/i));
+});
+
+test('missing operator is treated as equality (maps, preserves prior behavior)', (ctx) => {
+  const z = base();
+  z.filter = { all: [{ field: 'group_id', value: 100 }], any: [] }; // no operator
+  const { manual, payload } = transformSla(z, ctx);
+  assert.ok(!manual);
+  assert.deepStrictEqual(payload.applicable_to, { group_ids: [500] });
+});
+
 test('unicode / long / special-char names pass through unchanged', (ctx) => {
   for (const name of ['日本 Support', 'SLA #1 & Premium (Gold)/IT', 'Enterprise Global Premium Platinum 24x7 Critical Incident Resolution Policy for International Customers']) {
     const z = base(); z.title = name;
