@@ -87,11 +87,15 @@ class MongoAdapter {
   // schema is visible in Studio 3T before any data flows (and so unique/TTL
   // indexes exist before the first write races them).
   async ensureCollections() {
-    for (const name of ALL_COLLECTIONS) {
+    // Do all collections CONCURRENTLY — this runs on every boot (and every dev
+    // restart), and a sequential loop over ~25 collections (a createCollection +
+    // syncIndexes round-trip each) was the bulk of startup latency. Parallel turns
+    // "sum of all round-trips" into "the single slowest one".
+    await Promise.all(ALL_COLLECTIONS.map(async (name) => {
       const model = this._model(name);
       try { await model.createCollection(); } catch (e) { if (e.codeName !== 'NamespaceExists') throw e; }
       await model.syncIndexes();
-    }
+    }));
   }
 }
 

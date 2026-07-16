@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useRef } from 'react';
 import * as XLSX from 'xlsx';
 import { api } from './api.js';
 
@@ -143,12 +143,25 @@ export function Progress({ report, matrix, progress, mode }) {
   // made the ring read 100% with 0 errors while tickets were still loading/failing.
   const rows = matrix || [];
   const source = rows.reduce((a, r) => a + (r.source || 0), 0);
-  const done = rows.reduce((a, r) => a + (r.migrated || 0) + (r.validated || 0), 0);
   const manual = rows.reduce((a, r) => a + (r.manual || 0), 0);
-  const failed = rows.reduce((a, r) => a + (r.failed || 0), 0);
-  // Cap at 99% until the run is actually finished (the parent swaps to the
-  // completion view on terminal status); 100% should mean done, not "counts add up".
-  const pct = source ? Math.min(99, ((done + manual + failed) / source) * 100) : 0;
+  // Drive the ring + "migrated" from THIS run's batch progress (per-job), NOT the
+  // record-status matrix. The matrix is cumulative across runs, so a RE-RUN into an
+  // already-populated target reads "almost everything already done" and the ring
+  // snapped to ~99% at the start. `progress` (computeProgress) is scoped to the
+  // current job, so it starts at 0 each run and animates up — even on a re-run
+  // (where records are quickly reused/skipped). Reset when the job id changes.
+  const jobId = progress?.jobId ?? null;
+  const items = progress?.totals?.items || {};
+  const processed = progress?.totals?.processed ?? 0;
+  const failed = items.failed || 0;
+  const done = (items.ok || 0) + (items.skipped || 0); // handled in the target this run
+  const ringRef = useRef({ jobId: undefined, pct: 0 });
+  if (ringRef.current.jobId !== jobId) ringRef.current = { jobId, pct: 0 }; // new run → restart from 0
+  // Cap at 99% until the run is actually finished (parent swaps to the completion
+  // view on terminal status). Monotonic within the run so it never ticks backward.
+  const rawPct = source ? Math.min(99, (processed / source) * 100) : 0;
+  const pct = Math.max(ringRef.current.pct, rawPct);
+  ringRef.current.pct = pct;
   const cells = [
     ['Objects', source, ''],
     [mode === 'dry' ? 'Would migrate' : 'Migrated', done, 'green'],

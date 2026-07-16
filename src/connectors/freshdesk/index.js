@@ -93,6 +93,15 @@ export class FreshdeskTarget {
     // — the Freshdesk ticket ID itself can't be preserved (system-assigned).
     if (targetType === 'tickets' && ctx.migrationMeta) {
       const fields = await this.ensureMigrationFields();
+      // IDEMPOTENCY — tickets have no natural unique key, so a fresh run (empty
+      // idmap) or a re-migration into the same account would otherwise pile up
+      // duplicate tickets. Before creating, search for a ticket already stamped
+      // with this Original Ticket ID and REUSE it instead. (Same-run dedup is the
+      // idmap's job; this catches cross-run / cleared-idmap / new-project cases.)
+      if (fields.originalId && ctx.migrationMeta.originalId != null) {
+        const dup = await this._existingTicketByOriginalId(fields.originalId, ctx.migrationMeta.originalId);
+        if (dup) return { id: dup.id, raw: dup };
+      }
       const cf = {};
       if (fields.originalId && ctx.migrationMeta.originalId != null) cf[fields.originalId] = String(ctx.migrationMeta.originalId);
       if (fields.sourcePlatform && ctx.migrationMeta.sourcePlatform) cf[fields.sourcePlatform] = ctx.migrationMeta.sourcePlatform;
@@ -325,6 +334,21 @@ export class FreshdeskTarget {
       return out;
     })();
     return this._migrationFieldsP;
+  }
+
+  // Reuse an existing migrated ticket by its "Original Ticket ID" provenance field,
+  // so re-runs / new projects don't create duplicate tickets. Freshdesk's search
+  // index lags ~1 min for brand-new tickets, but same-run dedup is the idmap's job;
+  // this catches the cross-run / cleared-idmap case where the source ticket was
+  // already migrated in a PREVIOUS run (and is therefore already indexed).
+  async _existingTicketByOriginalId(fieldName, originalId) {
+    if (!fieldName || originalId == null) return null;
+    try {
+      const q = encodeURIComponent(`"${fieldName}:'${String(originalId)}'"`);
+      const { data } = await this.http.get(`/search/tickets?query=${q}`);
+      const results = Array.isArray(data?.results) ? data.results : [];
+      return results[0] || null;
+    } catch { return null; }
   }
 
   // Canned responses must live in a folder. Find/create one and cache its id,
